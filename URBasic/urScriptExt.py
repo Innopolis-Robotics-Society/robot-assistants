@@ -378,7 +378,7 @@ end
                     read_input_float_register(3),
                     read_input_float_register(4),
                     read_input_float_register(5)]
-        servoj([0+new_pose[0], new_pose[1],  0+new_pose[2],   new_pose[3], new_pose[4], new_pose[5]], t=.25, gain=190)
+        servoj(get_inverse_kin(new_pose), t=0.4, lookahead_time= 0.07, gain=350)
 
         sync()
     end
@@ -672,6 +672,13 @@ end
         print the actual TCP pose
         '''
         self.print_pose(self.get_actual_tcp_pose())
+
+    def get_actual_tcp_pose_custom(self):
+        '''
+        return the actual TCP pose
+        '''
+        return self.get_actual_tcp_pose()
+        
 
     def print_actual_joint_positions(self):
         '''

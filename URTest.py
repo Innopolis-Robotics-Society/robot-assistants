@@ -2,7 +2,7 @@ import URBasic
 import URBasic.robotModel
 import URBasic.urScriptExt
 import time
-HOST = "172.31.1.26"
+HOST = "192.168.0.100"
 
 robotModel = URBasic.robotModel.RobotModel()
 
@@ -13,7 +13,7 @@ robot = URBasic.urScriptExt.UrScriptExt(host=HOST, robotModel=robotModel)
 
 robot.init_realtime_control()
 print('Robot Pose: [{: 06.4f}, {: 06.4f}, {: 06.4f},   {: 06.4f}, {: 06.4f}, {: 06.4f}]'.format(*robot.get_actual_tcp_pose_custom()))
-input()
+input('1?')
 robot.set_realtime_pose([-0.643, 0.059,0.05,2.8,-1.026,0])
 input()
 robot.set_realtime_pose([-0.643, 0.059,0.1,2.8,-1.026,0])

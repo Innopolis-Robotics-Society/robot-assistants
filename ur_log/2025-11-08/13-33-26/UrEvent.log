@@ -1,0 +1,2 @@
+2025-11-08 13:33:37,621 - URBasic_rtdeEvent - ERROR - Lost some RTDE at 7411.5109999999995 - 10.000000000218279 milliseconds since last package
+2025-11-08 13:33:37,635 - URBasic_realTimeClientEvent - ERROR - SendProgram: Safety Stop
