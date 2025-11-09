@@ -2,28 +2,163 @@ import URBasic
 import URBasic.robotModel
 import URBasic.urScriptExt
 import time
+import math
+
 HOST = "192.168.0.100"
 
-robotModel = URBasic.robotModel.RobotModel()
+def normalize_angle(angle):
+    """Нормализует угол в диапазон [-pi, pi]"""
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
 
+def check_position(current_pos, target_pos, linear_tolerance=0.001, angle_tolerance=0.001):
+    """Проверяет, достигнута ли целевая позиция с учетом нормализации углов"""
+    position_reached = True
+    
+    print("Проверка позиции:")
+    for i, (current, target) in enumerate(zip(current_pos, target_pos)):
+        if i < 3:  # Позиция (x, y, z) - линейные координаты
+            diff = abs(current - target)
+            if diff > linear_tolerance:
+                position_reached = False
+            print(f"Ось {i}(лин.): текущая={current:08.6f}, целевая={target:08.6f}, разница={diff:08.6f} {'✓' if diff <= linear_tolerance else '✗'}")
+        else:  # Ориентация (rx, ry, rz) - углы
+            # Нормализуем углы перед сравнением
+            norm_current = normalize_angle(current)
+            norm_target = normalize_angle(target)
+            diff = abs(norm_current - norm_target)
+            if diff > angle_tolerance:
+                position_reached = False
+            print(f"Ось {i}(угл.): текущая={current:08.6f}→{norm_current:08.6f}, целевая={target:08.6f}→{norm_target:08.6f}, разница={diff:08.6f} {'✓' if diff <= angle_tolerance else '✗'}")
+    
+    print(f"Позиция достигнута: {position_reached}")
+    print("-" * 80)
+    
+    return position_reached
+
+def wait_for_position(robot, target_pos, position_name="", timeout=15.0, check_interval=0.05):
+    """Ожидает достижения целевой позиции с таймаутом"""
+    start_time = time.time()
+    attempt = 0
+    
+    while time.time() - start_time < timeout:
+        attempt += 1
+        current_pos = robot.get_actual_tcp_pose_custom()
+        print(f"Попытка {attempt} для {position_name}:")
+        
+        if check_position(current_pos, target_pos):
+            print(f"✓ Позиция '{position_name}' успешно достигнута!")
+            return True
+        
+        # Показываем прогресс каждые 10 попыток
+        if attempt % 10 == 0:
+            elapsed = time.time() - start_time
+            print(f"Прогресс: {elapsed:.1f}с из {timeout}с")
+        
+        time.sleep(check_interval)
+    
+    print(f"✗ Таймаут: позиция '{position_name}' не достигнута за {timeout} секунд")
+    return False
+
+def pause_at_position(position_name, duration=2.0):
+    """Пауза в достигнутой позиции"""
+    print(f"⏸️  Пауза {duration} секунд в позиции '{position_name}'...")
+    time.sleep(duration)
+    print(f"▶️  Пауза завершена, продолжаем работу.")
+
+# Инициализация робота
+robotModel = URBasic.robotModel.RobotModel()
 print("Initialization UR")
 
-robot = URBasic.urScriptExt.UrScriptExt(host=HOST, robotModel=robotModel)
+try:
+    robot = URBasic.urScriptExt.UrScriptExt(host=HOST, robotModel=robotModel)
+    robot.init_realtime_control()
+    
+    # Получение текущей позиции
+    current_pos = robot.get_actual_tcp_pose_custom()
+    print('Текущая позиция робота: [{: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}]'.format(*current_pos))
 
+    input('Нажмите Enter для перехода в начальную позицию...')
+    
+    # Переход в начальную позицию
+    init_pos = [-0.23, -1, 0.7, 0, -3.143, 0]  # Исправлено с 0.9 на 0.7
+    print(f"Переход в начальную позицию: {init_pos}")
+    robot.set_realtime_pose(init_pos)
+    
+    # Ожидание достижения начальной позиции
+    if not wait_for_position(robot, init_pos, "Начальная позиция"):
+        print("Ошибка: не удалось достичь начальной позиции")
+        robot.close()
+        exit()
 
-robot.init_realtime_control()
-print('Robot Pose: [{: 06.4f}, {: 06.4f}, {: 06.4f},   {: 06.4f}, {: 06.4f}, {: 06.4f}]'.format(*robot.get_actual_tcp_pose_custom()))
-input('1?')
-robot.set_realtime_pose([-0.643, 0.059,0.05,2.8,-1.026,0])
-input()
-robot.set_realtime_pose([-0.643, 0.059,0.1,2.8,-1.026,0])
-input()
-robot.set_realtime_pose([-0.643, 0.059,0.4,2.8,-1.026,2])
-print("position send, close")
-while 1:
-    print('Robot Pose: [{: 06.4f}, {: 06.4f}, {: 06.4f},   {: 06.4f}, {: 06.4f}, {: 06.4f}]'.format(*robot.get_actual_tcp_pose_custom()))
-    print(robot.get_actual_tcp_pose_custom())
+    # Ввод параметров
+    type_obj = int(input('Введите тип предмета (1, 2, 3): '))
+    x = float(input('Введите координату x (м): '))
+    y = float(input('Введите координату y (м): '))
+    
+    # Корректировка координат относительно начальной позиции
+    z_0 = 0.35
+    x_adj = x - 0.23
+    y_adj = y - 1
+    z_adj = z_0 - 0.1 * type_obj
 
-robot.close()
+    # Промежуточная позиция
+    intermediate_pos = [-0.23, -1, 0.7, 0, -3.143, 0]
+    print(f"Переход в промежуточную позицию: {intermediate_pos}")
+    robot.set_realtime_pose(intermediate_pos)
+    
+    if not wait_for_position(robot, intermediate_pos, "Промежуточная позиция"):
+        print("Ошибка: не удалось достичь промежуточной позиции")
+        robot.close()
+        exit()
 
-"[-0.7860,  0.3171, -0.1065,    2.8000, -1.0260, -0.0002]"
+    # Пауза в промежуточной позиции
+    pause_at_position("Промежуточная позиция")
+
+    # ДОПОЛНИТЕЛЬНАЯ ТОЧКА: Высота z_0 перед спуском к объекту
+    approach_pos = [x_adj, y_adj, z_0, 0, -3.143, 0]
+    print(f"Переход в точку подхода (высота z_0): {approach_pos}")
+    robot.set_realtime_pose(approach_pos)
+    
+    if not wait_for_position(robot, approach_pos, "Точка подхода (z_0)"):
+        print("Ошибка: не удалось достичь точки подхода")
+        robot.close()
+        exit()
+
+    # Пауза в точке подхода
+    pause_at_position("Точка подхода (z_0)")
+
+    # Целевая позиция (нижняя точка)
+    target_pos = [x_adj, y_adj, z_adj, 0, -3.143, 0]
+    print(f"Переход в целевую позицию (нижняя точка): {target_pos}")
+    robot.set_realtime_pose(target_pos)
+    
+    if not wait_for_position(robot, target_pos, "Нижняя точка"):
+        print("Ошибка: не удалось достичь целевой позиции")
+        robot.close()
+        exit()
+
+    # Пауза в нижней точке
+    pause_at_position("Нижняя точка")
+
+    # Возврат в промежуточную позицию
+    print("Возврат в промежуточную позицию")
+    robot.set_realtime_pose(intermediate_pos)
+    wait_for_position(robot, intermediate_pos, "Промежуточная позиция (возврат)")
+
+    # Пауза в промежуточной позиции при возврате
+    pause_at_position("Промежуточная позиция (возврат)")
+
+    print("Программа завершена успешно")
+
+except Exception as e:
+    print(f"Произошла ошибка: {e}")
+    import traceback
+    traceback.print_exc()
+finally:
+    # Всегда закрываем соединение с роботом
+    if 'robot' in locals():
+        robot.close()
