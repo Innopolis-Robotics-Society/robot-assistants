@@ -18,7 +18,9 @@ if p not in sys.path:
 # import ONE function, with a clear alias
 from localizer import measure_xy_once as measure_xy
 
-
+RAW = 2.857
+PITCH = -1.309
+YAW = 0.0
 HOST = "192.168.0.100"
 
 def normalize_angle(angle):
@@ -29,7 +31,7 @@ def normalize_angle(angle):
         angle += 2 * math.pi
     return angle
 
-def check_position(current_pos, target_pos, linear_tolerance=0.001, angle_tolerance=0.001):
+def check_position(current_pos, target_pos, linear_tolerance=0.001, angle_tolerance=0.01):
     """Проверяет, достигнута ли целевая позиция с учетом нормализации углов"""
     position_reached = True
     
@@ -44,7 +46,9 @@ def check_position(current_pos, target_pos, linear_tolerance=0.001, angle_tolera
             # Нормализуем углы перед сравнением
             norm_current = normalize_angle(current)
             norm_target = normalize_angle(target)
-            diff = abs(norm_current - norm_target)
+            diff = abs(-norm_current - norm_target)
+            # print(f"norm_targ:= {norm_target}" )
+            # print(f"norm_cur:= {current}" )
             if diff > angle_tolerance:
                 position_reached = False
             print(f"Ось {i}(угл.): текущая={current:08.6f}→{norm_current:08.6f}, целевая={target:08.6f}→{norm_target:08.6f}, разница={diff:08.6f} {'✓' if diff <= angle_tolerance else '✗'}")
@@ -99,7 +103,7 @@ try:
     input('Нажмите Enter для перехода в начальную позицию...')
     
     # Переход в начальную позицию
-    init_pos = [-0.23, -1, 0.7, 0, -3.143, 0]  # Исправлено с 0.9 на 0.7
+    init_pos = [-0.23, -1, 0.7, RAW, PITCH, YAW]  # Исправлено с 0.9 на 0.7
     print(f"Переход в начальную позицию: {init_pos}")
     robot.set_realtime_pose(init_pos)
     
@@ -118,13 +122,20 @@ try:
     print("Измеряю координаты COM камерой...")
     xy = None
     for attempt in range(5):
-        x, y = measure_xy(display=False, warmup_s=1.5)
-        if xy is not None:
+        res = measure_xy(display=False, warmup_s=1.5)  # returns (x,y) or None
+        if res is not None:
+            xy = res
             break
         time.sleep(0.2)
-    
+
+    # optional: one more attempt with on-screen debug if still None
     if xy is None:
-        # fallback to manual
+        res = measure_xy(display=True, warmup_s=1.5)
+        if res is not None:
+            xy = res
+
+    if xy is None:
+        # fallback to manual input
         x = float(input("x (m): "))
         y = float(input("y (m): "))
     else:
@@ -132,13 +143,13 @@ try:
         print(f"COM по камере: x={x:.4f} м, y={y:.4f} м")
 
     # Корректировка координат относительно начальной позиции
-    z_0 = 0.45
+    z_0 = 0.505
     x_adj = x - 0.23
     y_adj = y - 1
     z_adj = z_0 - 0.3
 
     # Промежуточная позиция
-    intermediate_pos = [-0.23, -1, 0.7, 0, -3.143, 0]
+    intermediate_pos = [-0.23, -1, 0.5, RAW, PITCH, YAW]
     print(f"Переход в промежуточную позицию: {intermediate_pos}")
     robot.set_realtime_pose(intermediate_pos)
     
@@ -151,7 +162,7 @@ try:
     pause_at_position("Промежуточная позиция")
 
     # ДОПОЛНИТЕЛЬНАЯ ТОЧКА: Высота z_0 перед спуском к объекту
-    approach_pos = [x_adj, y_adj, z_0, 0, -3.143, 0]
+    approach_pos = [x_adj, y_adj, z_0, RAW, PITCH, YAW]
     print(f"Переход в точку подхода (высота z_0): {approach_pos}")
     robot.set_realtime_pose(approach_pos)
     
@@ -163,8 +174,11 @@ try:
     # Пауза в точке подхода
     pause_at_position("Точка подхода (z_0)")
 
+
+    
+
     # Целевая позиция (нижняя точка)
-    target_pos = [x_adj, y_adj, z_adj, 0, -3.143, 0]
+    target_pos = [x_adj, y_adj, z_adj, RAW, PITCH, YAW]
     print(f"Переход в целевую позицию (нижняя точка): {target_pos}")
     robot.set_realtime_pose(target_pos)
     

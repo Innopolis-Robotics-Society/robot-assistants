@@ -1,92 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-localizer.py
-YOLO crop -> shadow-robust mask (tunable) -> COM inside mask -> pixel->ground XY (meters).
-"""
-
 import cv2 as cv
 import numpy as np
 from ultralytics import YOLO
 from typing import Optional, Tuple, Dict
-import time, math, subprocess, shutil, os
+import time
 
-# ========= CONFIG =========
-MODEL = "/home/ben/manip/best_fixed.pt"
-CAM_INDEX = 0
+# ==== CONFIG ====
+MODEL = "/home/ben/take/ur10-assistant/hoba/best_fixed.pt"
+CAM_INDEX = 7
 IMGZ = 640
 
-# Camera intrinsics (pixels)
-FX = 1100.0
-FY = 1100.0
-CX: Optional[float] = None
-CY: Optional[float] = None
+# Intrinsics @ 1920x1080
+FX, FY = 1769.9768, 1758.5401
+CX, CY = 1038.8629, 534.7359
+CAP_W, CAP_H = 1920, 1080
 
-# Camera height above the ground plane (m). Camera axis ⟂ plane.
+# Distortion (k1,k2,p1,p2,k3)
+DIST = np.array([[
+    -0.01703867068037522, 1.6164689285399254,
+    -0.0020304471957141106, -0.0014182118041878213,
+    -8.2797801162119313
+]], dtype=np.float64).T
+K = np.array([[FX, 0.0, CX],
+              [0.0, FY, CY],
+              [0.0, 0.0, 1.0]], dtype=np.float64)
+
+# Default plane distance (camera ⟂ plane)
 H_CAM_M = 0.75
 
-# BBox expansion
 PAD_REL = 0.07
 MIN_PAD = 8
-# =========================
+# ==============
 
 _MODEL: Optional[YOLO] = None
-
 def _get_model() -> YOLO:
     global _MODEL
     if _MODEL is None:
         _MODEL = YOLO(MODEL)
     return _MODEL
 
-# ---------- camera warmup / autofocus lock ----------
-
-def _v4l2_devnode(cam_index: int) -> str:
-    return f"/dev/video{cam_index}"
-
-def _try_lock_autofocus(cap: cv.VideoCapture, cam_index: int, focus_abs: Optional[int]) -> None:
-    dev = _v4l2_devnode(cam_index)
-    if shutil.which("v4l2-ctl") and os.path.exists(dev):
-        try:
-            subprocess.run(["v4l2-ctl", "-d", dev, "--set-ctrl=focus_auto=0"], check=False,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if focus_abs is not None:
-                subprocess.run(["v4l2-ctl", "-d", dev, f"--set-ctrl=focus_absolute={int(focus_abs)}"], check=False,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
-        except Exception:
-            pass
-    # Fallback: OpenCV props (may not work on all cams)
-    try:
-        cap.set(getattr(cv, "CAP_PROP_AUTOFOCUS", 39), 0)
-        if focus_abs is not None:
-            cap.set(getattr(cv, "CAP_PROP_FOCUS", 28), float(focus_abs))
-    except Exception:
-        pass
-
+# ---------- camera ----------
 def _lap_var(gray: np.ndarray) -> float:
     return float(cv.Laplacian(gray, cv.CV_64F).var())
 
 def _grab_stable_frame(
     cam_index: int,
-    width: int = 1280,
-    height: int = 720,
-    warmup_s: float = 1.5,
+    warmup_s: float = 1.0,
     prefer_sharpest: bool = True,
-    lock_af: bool = True,
-    focus_abs: Optional[int] = None
 ) -> Optional[np.ndarray]:
     cap = cv.VideoCapture(cam_index, cv.CAP_V4L2)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
-
-    if lock_af:
-        _try_lock_autofocus(cap, cam_index, focus_abs)
+    cap.set(cv.CAP_PROP_FRAME_WIDTH, CAP_W)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, CAP_H)
 
     t0 = time.time()
-    best_var = -1.0
-    best = None
-    last = None
-
+    best_var, best, last = -1.0, None, None
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -95,17 +63,27 @@ def _grab_stable_frame(
         if prefer_sharpest:
             v = _lap_var(cv.cvtColor(frame, cv.COLOR_BGR2GRAY))
             if v > best_var:
-                best_var = v
-                best = frame.copy()
+                best_var, best = v, frame.copy()
         if time.time() - t0 >= warmup_s:
             break
-
     cap.release()
     if last is None:
         return None
     return best if (prefer_sharpest and best is not None) else last
 
-# ---------- geometry/utils ----------
+# ---------- utils ----------
+def undistort_pixel(u, v, K, dist):
+    pts = np.array([[[float(u), float(v)]]], dtype=np.float64)
+    und = cv.undistortPoints(pts, K, dist, P=K)  # pixel coords with P=K
+    return float(und[0,0,0]), float(und[0,0,1])
+
+def pixel_to_xy_known_depth(u_px: float, v_px: float, Z_m: float,
+                            K: np.ndarray, dist: np.ndarray) -> Tuple[float,float]:
+    u_u, v_u = undistort_pixel(u_px, v_px, K, dist)
+    fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+    X = (u_u - cx) / fx * Z_m
+    Y = (v_u - cy) / fy * Z_m
+    return float(X), float(Y)
 
 def _expand_box(x1: int, y1: int, x2: int, y2: int, W: int, H: int,
                 pad_rel: float = PAD_REL, min_pad: int = MIN_PAD) -> Tuple[int, int, int, int]:
@@ -119,9 +97,7 @@ def _expand_box(x1: int, y1: int, x2: int, y2: int, W: int, H: int,
 def _gray_world(bgr: np.ndarray) -> np.ndarray:
     b, g, r = cv.split(bgr.astype(np.float32))
     m = (b.mean() + g.mean() + r.mean()) / 3.0
-    b *= m / max(b.mean(), 1e-6)
-    g *= m / max(g.mean(), 1e-6)
-    r *= m / max(r.mean(), 1e-6)
+    b *= m / max(b.mean(), 1e-6); g *= m / max(g.mean(), 1e-6); r *= m / max(r.mean(), 1e-6)
     out = cv.merge([b, g, r])
     return np.clip(out, 0, 255).astype(np.uint8)
 
@@ -140,36 +116,28 @@ def remove_shadows_white_bg_auto(
     h, w = bgr.shape[:2]
     hsv = cv.cvtColor(bgr, cv.COLOR_BGR2HSV)
     S, V = hsv[..., 1], hsv[..., 2]
-
     b = max(6, int(0.1 * min(h, w)))
     bm = np.zeros((h, w), dtype=bool)
     bm[:b, :] = True; bm[-b:, :] = True; bm[:, :b] = True; bm[:, -b:] = True
-
     s_thr = int(np.clip(np.percentile(S[bm], s_p) + s_off, *s_clip))
     v_thr = int(np.clip(np.percentile(V[bm], v_p), *v_clip))
-
     gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
     k = max(31, (int(min(h, w) * k_div_frac) // 2) * 2 + 1)
     bg = cv.medianBlur(gray, k)
     norm = cv.GaussianBlur(cv.divide(gray, bg, scale=255), (0, 0), 1.0)
-
     _, bin_otsu = cv.threshold(norm, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
     obj_int = (bin_otsu == 0)
     paper = (S < s_thr) & (V > v_thr)
     obj_color = (S > s_thr + 10) | (V < v_thr - 40)
-
     mask = ((obj_int | obj_color) & (~paper)).astype(np.uint8) * 255
-
     kC = cv.getStructuringElement(cv.MORPH_ELLIPSE, (morph_close, morph_close))
     kO = cv.getStructuringElement(cv.MORPH_ELLIPSE, (morph_open, morph_open))
     mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kC)
     mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kO)
-
     num, labels, stats, _ = cv.connectedComponentsWithStats(mask, 8)
     if num > 1:
         idx = 1 + np.argmax(stats[1:, cv.CC_STAT_AREA])
         mask = np.where(labels == idx, 255, 0).astype(np.uint8)
-
     return mask, {"s_thr": s_thr, "v_thr": v_thr, "k_div": k}
 
 def _com(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
@@ -195,127 +163,166 @@ def _snap_inside(cx: float, cy: float, mask_u8: np.ndarray, erode_iters: int = 1
     j = int(np.argmin((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2))
     return float(pts[j, 0]), float(pts[j, 1])
 
-def _pixel_to_ground(u_px: float, v_px: float, fx: float, fy: float, cx: float, cy: float, H_m: float) -> Tuple[float, float]:
-    # Camera perpendicular to plane. Origin at optical axis hit point.
-    X = (u_px - cx) / fx * H_m  # +X right
-    Y = (v_px - cy) / fy * H_m  # +Y forward (image-down)
-    return float(X), float(Y)
+def _annotate_debug(vis: np.ndarray,
+                    K: np.ndarray,
+                    Z_used_m: float,
+                    bbox: Optional[Tuple[int,int,int,int]] = None,
+                    raw: Optional[Tuple[float,float]] = None,
+                    und: Optional[Tuple[float,float]] = None,
+                    XY: Optional[Tuple[float,float]] = None,
+                    stage: Optional[str] = None) -> np.ndarray:
+    h, w = vis.shape[:2]
+    fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
+    font = cv.FONT_HERSHEY_SIMPLEX
+    out = vis.copy()
 
-def _draw_centroid(img: np.ndarray, pt_img: Tuple[float, float], color=(0, 0, 255), label="COM") -> np.ndarray:
-    out = img.copy()
-    x, y = int(round(pt_img[0])), int(round(pt_img[1]))
-    cv.drawMarker(out, (x, y), color, markerType=cv.MARKER_CROSS, markerSize=20, thickness=2)
-    cv.putText(out, f"{label} ({x},{y})", (x + 8, y - 8), cv.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv.LINE_AA)
+    if bbox is not None:
+        x1,y1,x2,y2 = map(int, bbox)
+        cv.rectangle(out, (x1,y1), (x2,y2), (0,255,0), 2)
+
+    cv.putText(out, "img (0,0)", (8,18), font, 0.6, (0,255,255), 2, cv.LINE_AA)
+
+    cpt = (int(round(cx)), int(round(cy)))
+    cv.circle(out, cpt, 6, (255,0,0), -1)
+    cv.putText(out, f"origin cx,cy=({int(cx)},{int(cy)})", (cpt[0]+8, cpt[1]-8),
+               font, 0.6, (255,0,0), 2, cv.LINE_AA)
+
+    ax_len = max(40, min(w,h)//8)
+    cv.arrowedLine(out, cpt, (cpt[0]+ax_len, cpt[1]), (0,200,0), 2, tipLength=0.15)
+    cv.arrowedLine(out, cpt, (cpt[0], cpt[1]+ax_len), (0,0,200), 2, tipLength=0.15)
+    cv.putText(out, "+X", (cpt[0]+ax_len+6, cpt[1]+4), font, 0.6, (0,200,0), 2, cv.LINE_AA)
+    cv.putText(out, "+Y", (cpt[0]+4, cpt[1]+ax_len+16), font, 0.6, (0,0,200), 2, cv.LINE_AA)
+
+    # scale bar for 0.10 m at current Z
+    px_per_0p10m = int(round((fx / Z_used_m) * 0.10))
+    xb, yb = 40, h - 30
+    cv.line(out, (xb, yb), (xb + px_per_0p10m, yb), (255,255,255), 3)
+    cv.putText(out, "0.10 m", (xb + px_per_0p10m + 8, yb + 6), font, 0.6, (255,255,255), 2, cv.LINE_AA)
+
+    if raw is not None:
+        cv.circle(out, (int(raw[0]), int(raw[1])), 6, (0,255,255), 2)
+    if und is not None:
+        cv.circle(out, (int(und[0]), int(und[1])), 6, (0,0,255), -1)
+        cv.line(out, cpt, (int(und[0]), int(und[1])), (0,0,255), 1)
+
+    lines = []
+    if stage is not None:
+        lines.append(f"stage: {stage}")
+    if raw is not None:
+        lines.append(f"raw px: ({raw[0]:.1f}, {raw[1]:.1f})")
+    if und is not None:
+        lines.append(f"undist px: ({und[0]:.1f}, {und[1]:.1f})")
+    lines.append(f"Z used: {Z_used_m:.3f} m")
+    if XY is not None:
+        lines.append(f"ground XY: ({XY[0]:.3f} m, {XY[1]:.3f} m)")
+    lines.append("axes: +X right, +Y down; origin=principal point")
+
+    x0, y0 = 10, 40
+    for i, t in enumerate(lines):
+        y = y0 + i*22
+        cv.putText(out, t, (x0, y), font, 0.6, (0,0,0), 3, cv.LINE_AA)
+        cv.putText(out, t, (x0, y), font, 0.6, (255,255,255), 1, cv.LINE_AA)
+
     return out
 
 # ---------- main API ----------
-
 def measure_xy_once(
     *,
     display: bool = False,
     device: str = "cpu",
-    # capture controls
     warmup_s: float = 1.5,
     prefer_sharpest: bool = True,
-    lock_af: bool = True,
-    focus_abs: Optional[int] = None,
-    # mask tunables
     s_p: int = 90, v_p: int = 60, s_off: int = 5,
     s_clip: Tuple[int, int] = (20, 140),
     v_clip: Tuple[int, int] = (160, 245),
     morph_close: int = 5, morph_open: int = 3,
     k_div_frac: float = 0.03,
     use_grayworld: bool = False,
-    # debug return
-    return_debug: bool = False
-) -> Optional[Tuple[float, float] | Tuple[Tuple[float, float], Dict[str, object]]]:
-    """
-    One-shot measurement.
-    Returns:
-      (X_m, Y_m)          if return_debug=False
-      ((X_m, Y_m), debug) if return_debug=True, where debug has:
-        frame, roi, mask, bbox, com_img, com_roi, thresholds(dict)
-    """
+    return_debug: bool = False,
+    z_override_m: Optional[float] = None  # if given, use this depth instead of H_CAM_M
+):
+    dbg: Dict[str, object] = {"stage": "start"}
     frame = _grab_stable_frame(
-        CAM_INDEX, 1280, 720,
-        warmup_s=warmup_s,
-        prefer_sharpest=prefer_sharpest,
-        lock_af=lock_af,
-        focus_abs=focus_abs
+        CAM_INDEX,
+        warmup_s=warmup_s, prefer_sharpest=prefer_sharpest
     )
     if frame is None:
-        return None
+        dbg["stage"] = "no_frame"
+        return (None, dbg) if return_debug else None
+    dbg["frame"] = frame
 
     Himg, Wimg = frame.shape[:2]
-    cx_intr = CX if CX is not None else (Wimg - 1) / 2.0
-    cy_intr = CY if CY is not None else (Himg - 1) / 2.0
+    _ = Himg, Wimg  # reserved
 
     model = _get_model()
     res = model.predict(source=frame, imgsz=IMGZ, device=device, conf=0.25, verbose=False)[0]
     if res.boxes is None or res.boxes.xyxy.numel() == 0:
-        return None
+        dbg["stage"] = "no_detection"
+        return (None, dbg) if return_debug else None
 
     idx = int(res.boxes.conf.argmax().item())
     x1, y1, x2, y2 = res.boxes.xyxy[idx].detach().cpu().numpy().astype(int)
     x1, y1, x2, y2 = _expand_box(x1, y1, x2, y2, Wimg, Himg)
     if x2 <= x1 or y2 <= y1:
-        return None
+        dbg["stage"] = "invalid_bbox"; dbg["bbox"] = (int(x1), int(y1), int(x2), int(y2))
+        return (None, dbg) if return_debug else None
+    dbg["bbox"] = (int(x1), int(y1), int(x2), int(y2))
 
     roi = frame[y1:y2, x1:x2].copy()
+    dbg["roi"] = roi
 
-    mask, dbg = remove_shadows_white_bg_auto(
+    mask, thr = remove_shadows_white_bg_auto(
         roi,
-        k_div_frac=k_div_frac,
-        s_p=s_p, v_p=v_p, s_off=s_off,
+        k_div_frac=k_div_frac, s_p=s_p, v_p=v_p, s_off=s_off,
         s_clip=s_clip, v_clip=v_clip,
         morph_close=morph_close, morph_open=morph_open,
         use_grayworld=use_grayworld
     )
+    dbg["mask"] = mask
+    dbg["thresholds"] = thr
 
     c = _com(mask)
     if c is None:
-        return None
+        dbg["stage"] = "no_com"; return (None, dbg) if return_debug else None
     c = _snap_inside(*c, mask)
     if c is None:
-        return None
+        dbg["stage"] = "snap_failed"; return (None, dbg) if return_debug else None
 
     u_img, v_img = x1 + c[0], y1 + c[1]
-    X_m, Y_m = _pixel_to_ground(u_img, v_img, FX, FY, cx_intr, cy_intr, H_CAM_M)
+    dbg["com_img_raw"] = (float(u_img), float(v_img))
+
+    # Compute XY using chosen depth
+    Z_used = float(z_override_m) if z_override_m is not None else float(H_CAM_M)
+    X_m, Y_m = pixel_to_xy_known_depth(u_img, v_img, Z_used, K, DIST)
+    dbg["com_img_undist"] = undistort_pixel(u_img, v_img, K, DIST)
+    dbg["stage"] = "ok"
+    dbg["Z_used"] = Z_used
 
     if display:
-        vis = frame.copy()
-        cv.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        vis = _draw_centroid(vis, (u_img, v_img), (0, 0, 255), "COM")
-        cv.imshow("original+COM", vis)
+        vis = _annotate_debug(
+            frame, K, Z_used,
+            bbox=(x1,y1,x2,y2),
+            raw=(u_img, v_img),
+            und=dbg["com_img_undist"],
+            XY=(X_m, Y_m),
+            stage=dbg["stage"]
+        )
+        cv.imshow("original(+debug)", vis)
         cv.imshow("roi", roi)
         cv.imshow("mask_final", mask)
         cv.waitKey(1)
 
-    if not return_debug:
-        return float(X_m), float(Y_m)
-
-    debug = {
-        "frame": frame,
-        "roi": roi,
-        "mask": mask,
-        "bbox": (x1, y1, x2, y2),
-        "com_img": (u_img, v_img),
-        "com_roi": (float(c[0]), float(c[1])),
-        "thresholds": dbg
-    }
-    return (float(X_m), float(Y_m)), debug
+    return (float(X_m), float(Y_m)) if not return_debug else ((float(X_m), float(Y_m)), dbg)
 
 # ---------- CLI ----------
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Measure COM XY in meters from a single frame.")
-    ap.add_argument("--display", action="store_true", help="Show quick preview windows during measure.")
-    ap.add_argument("--debug", action="store_true", help="After measuring, show original, ROI, and mask with COM and wait for key.")
+    ap.add_argument("--display", action="store_true")
+    ap.add_argument("--debug", action="store_true")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--warmup", type=float, default=1.5)
     ap.add_argument("--no-sharpest", action="store_true")
-    ap.add_argument("--no-lock-af", action="store_true")
-    ap.add_argument("--focus", type=int, default=None)
     ap.add_argument("--s_p", type=int, default=90)
     ap.add_argument("--v_p", type=int, default=60)
     ap.add_argument("--s_off", type=int, default=5)
@@ -325,46 +332,46 @@ if __name__ == "__main__":
     ap.add_argument("--morph_open", type=int, default=3)
     ap.add_argument("--k_div_frac", type=float, default=0.03)
     ap.add_argument("--grayworld", action="store_true")
+    ap.add_argument("--depth", type=float, default=None, help="Override depth Z [m]. If unset, uses H_CAM_M.")
     args = ap.parse_args()
 
     out = measure_xy_once(
         display=args.display, device=args.device,
-        warmup_s=args.warmup,
-        prefer_sharpest=(not args.no_sharpest),
-        lock_af=(not args.no_lock_af),
-        focus_abs=args.focus,
+        warmup_s=args.warmup, prefer_sharpest=(not args.no_sharpest),
         s_p=args.s_p, v_p=args.v_p, s_off=args.s_off,
         s_clip=tuple(args.s_clip), v_clip=tuple(args.v_clip),
         morph_close=args.morph_close, morph_open=args.morph_open,
         k_div_frac=args.k_div_frac, use_grayworld=args.grayworld,
-        return_debug=args.debug
+        return_debug=args.debug, z_override_m=args.depth
     )
 
-    if out is None:
-        print("FAIL")
-    else:
-        if args.debug:
-            (x_m, y_m), dbg = out
-            print(f"{x_m:.6f} {y_m:.6f}  |  thr={dbg['thresholds']}")
-            # make full debug windows that wait for key
-            frame = dbg["frame"]
-            roi = dbg["roi"]
-            mask = dbg["mask"]
-            (x1, y1, x2, y2) = dbg["bbox"]
-            u_img, v_img = dbg["com_img"]
+    if args.debug:
+        coords, dbg = out if (isinstance(out, tuple) and isinstance(out[1], dict)) else (None, {"stage":"unknown"})
+        stage = dbg.get("stage", "unknown")
+        frame = dbg.get("frame"); roi = dbg.get("roi"); mask = dbg.get("mask")
+        bbox  = dbg.get("bbox");  raw = dbg.get("com_img_raw"); und  = dbg.get("com_img_undist")
+        Z_used = dbg.get("Z_used", (args.depth if args.depth is not None else H_CAM_M))
 
-            vis = frame.copy()
-            cv.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            vis = _draw_centroid(vis, (u_img, v_img), (0, 0, 255), "COM")
-            txt = f"X={x_m:.3f}m Y={y_m:.3f}m  S<{dbg['thresholds']['s_thr']} V>{dbg['thresholds']['v_thr']} k={dbg['thresholds']['k_div']}"
-            cv.putText(vis, txt, (10, 28), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv.LINE_AA)
-            cv.putText(vis, txt, (10, 28), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv.LINE_AA)
-
-            cv.imshow("original+COM", vis)
+        if frame is not None:
+            vis = _annotate_debug(frame, K, Z_used, bbox=bbox, raw=raw, und=und,
+                                  XY=(coords if coords is not None else None),
+                                  stage=stage)
+            cv.imshow("original(+debug)", vis)
+        if roi is not None:
             cv.imshow("roi", roi)
+        if mask is not None:
             cv.imshow("mask_final", mask)
-            cv.waitKey(0)
-            cv.destroyAllWindows()
+
+        if coords is not None:
+            x_m, y_m = coords
+            print(f"{x_m:.6f} {y_m:.6f}  |  Z_used={Z_used:.3f}  stage={stage} thr={dbg.get('thresholds')}")
+        else:
+            print(f"FAIL  |  Z_used={Z_used:.3f}  stage={stage} thr={dbg.get('thresholds')}")
+        cv.waitKey(0); cv.destroyAllWindows()
+    else:
+        if out is None:
+            print("FAIL")
         else:
             x_m, y_m = out
-            print(f"{x_m:.6f} {y_m:.6f}")
+            Zu = args.depth if args.depth is not None else H_CAM_M
+            print(f"{x_m:.6f} {y_m:.6f}  |  Z_used={Zu:.3f}")
