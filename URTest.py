@@ -3,6 +3,21 @@ import URBasic.robotModel
 import URBasic.urScriptExt
 import time
 import math
+import sys, json
+import sys, os
+from pathlib import Path
+# sys.path.append("~/take/ur10-assistant/hoba")
+VPATH = Path.home() / "take" / "ur10-assistant" / "hoba"
+assert VPATH.exists(), f"bad path: {VPATH}"
+
+# prepend once
+p = str(VPATH)
+if p not in sys.path:
+    sys.path.insert(0, p)
+
+# import ONE function, with a clear alias
+from localizer import measure_xy_once as measure_xy
+
 
 HOST = "192.168.0.100"
 
@@ -96,9 +111,26 @@ try:
 
     # Ввод параметров
     # type_obj = int(input('Введите тип предмета (1, 2, 3): '))
-    x = float(input('Введите координату x (м): '))
-    y = float(input('Введите координату y (м): '))
+    # x = float(input('Введите координату x (м): '))
+    # y = float(input('Введите координату y (м): '))
+
+
+    print("Измеряю координаты COM камерой...")
+    xy = None
+    for attempt in range(5):
+        x, y = measure_xy(display=False, warmup_s=1.5)
+        if xy is not None:
+            break
+        time.sleep(0.2)
     
+    if xy is None:
+        # fallback to manual
+        x = float(input("x (m): "))
+        y = float(input("y (m): "))
+    else:
+        x, y = xy
+        print(f"COM по камере: x={x:.4f} м, y={y:.4f} м")
+
     # Корректировка координат относительно начальной позиции
     z_0 = 0.45
     x_adj = x - 0.23
