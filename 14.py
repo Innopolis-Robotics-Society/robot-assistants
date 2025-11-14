@@ -129,6 +129,8 @@ def find_tools_in_command(command, similarity_threshold=0.7):
     
     return list(set(found_tools))
 
+
+
 def pick_input_device():
     devs = sd.query_devices()
     # приоритет: pulse → default → любой с входом
@@ -145,6 +147,7 @@ def pick_input_device():
 
 device_m = pick_input_device()
 samplerate = int(sd.query_devices(device_m, 'input')["default_samplerate"])
+
 q = queue.Queue()
 model = vosk.Model("model_stt/vosk-model-small-ru-0.22")
 
@@ -161,12 +164,12 @@ def voice_assistant():
         robotModel = URBasic.robotModel.RobotModel()
         print("Initialization UR")
 
-        robot = URBasic.urScriptExt.UrScriptExt(host=HOST, robotModel=robotModel)
-        robot.init_realtime_control()
+        #robot = URBasic.urScriptExt.UrScriptExt(host=HOST, robotModel=robotModel)
+        #robot.init_realtime_control()
         
         # Получение текущей позиции
-        current_pos = robot.get_actual_tcp_pose_custom()
-        print('Текущая позиция робота: [{: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}]'.format(*current_pos))
+        #current_pos = robot.get_actual_tcp_pose_custom()
+        #print('Текущая позиция робота: [{: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}, {: 08.6f}]'.format(*current_pos))
 
         input('Нажмите Enter для перехода в начальную позицию...')
 
@@ -174,13 +177,13 @@ def voice_assistant():
         # Переход в начальную позицию
         target_pos = waiting_pose  # Исправлено с 0.9 на 0.7
         print(f"Переход в начальную позицию: {target_pos}")
-        robot.set_realtime_pose(target_pos)
+        #robot.set_realtime_pose(target_pos)
         
         # Ожидание достижения начальной позиции
-        if not wait_for_position(robot, target_pos, "Начальная позиция"):
-            print("Ошибка: не удалось достичь начальной позиции")
-            robot.close()
-            exit()
+        #if not wait_for_position(robot, target_pos, "Начальная позиция"):
+        #    print("Ошибка: не удалось достичь начальной позиции")
+        #    robot.close()
+        #    exit()
 
         
 
