@@ -1,53 +1,100 @@
-# pip install ultralytics opencv-python
-import sys
 import cv2 as cv
 import torch
 from ultralytics import YOLO
 
-cam = int(sys.argv[1]) if len(sys.argv) > 1 else 0  # индекс камеры
-w   = int(sys.argv[2]) if len(sys.argv) > 2 else 1280
-h   = int(sys.argv[3]) if len(sys.argv) > 3 else 720
-CONF = 0.25  # порог уверенности
 
-cap = cv.VideoCapture(cam)
+class YOLOCamera:
+    """
+    Класс для захвата видео с камеры и обработки кадров моделью YOLO.
+    """
 
-cap.set(cv.CAP_PROP_FRAME_WIDTH,  w)
-cap.set(cv.CAP_PROP_FRAME_HEIGHT, h)
-cap.set(cv.CAP_PROP_FPS, 30)
-cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))  # often gives better color
+    def __init__(
+        self,
+        cam_index: int = 0,
+        width: int = 1280,
+        height: int = 720,
+        conf_threshold: float = 0.25,
+        warmup_frames: int = 45,
+    ):
+        self.cam_index = cam_index
+        self.width = width
+        self.height = height
+        self.conf_threshold = conf_threshold
+        self.warmup_frames = warmup_frames
 
-# Warm-up to let AE/AWB settle
-for _ in range(45):
-    cap.read()
-    cv.waitKey(1)
+        self.cap = None
+        self.model = None
 
-# Try to lock after warm-up (support varies by driver)
-cap.set(cv.CAP_PROP_AUTO_WB, 0)                 # 0=manual
-cap.set(cv.CAP_PROP_WB_TEMPERATURE, 4600)       # tweak 3000–6500 as needed
+    # ------------------------------------------------------------------
+    def init_camera(self):
+        """Инициализация камеры и установка параметров."""
+        self.cap = cv.VideoCapture(self.cam_index)
 
-# OpenCV’s AUTO_EXPOSURE mapping is odd on V4L2: 0.25=manual, 0.75=auto
-cap.set(cv.CAP_PROP_AUTO_EXPOSURE, 0.25)        # manual
-cap.set(cv.CAP_PROP_EXPOSURE, 200)              # units are driver-specific
-cap.set(cv.CAP_PROP_GAIN, 0)
+        self.cap.set(cv.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv.CAP_PROP_FPS, 30)
+        self.cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*"MJPG"))
+
+        # Warm-up (стабилизация автоэкспозиции и автоББ)
+        for _ in range(self.warmup_frames):
+            self.cap.read()
+            cv.waitKey(1)
+
+        # Настройки экспозиции/ББ (если поддерживаются драйвером)
+        self.cap.set(cv.CAP_PROP_AUTO_WB, 0)
+        self.cap.set(cv.CAP_PROP_WB_TEMPERATURE, 4600)
+
+        # OpenCV → V4L2: AUTO_EXPOSURE = 0.25 == manual
+        self.cap.set(cv.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        self.cap.set(cv.CAP_PROP_EXPOSURE, 200)
+        self.cap.set(cv.CAP_PROP_GAIN, 0)
+
+    # ------------------------------------------------------------------
+    def init_model(self, weights: str = "yolov8s.pt"):
+        """Загрузка модели YOLO."""
+        self.model = YOLO(weights)
+
+        if torch.cuda.is_available():
+            self.model.to("cuda")
+
+    # ------------------------------------------------------------------
+    def run(self):
+        """
+        Основной цикл обработки видео.
+        Нажмите ESC или 'q' для выхода.
+        """
+        if self.cap is None:
+            self.init_camera()
+
+        if self.model is None:
+            self.init_model()
+
+        while True:
+            ok, frame = self.cap.read()
+            if not ok:
+                print("❌ Ошибка чтения кадра.")
+                break
+
+            results = self.model(frame, conf=self.conf_threshold, verbose=False)[0]
+            annotated = results.plot()
+
+            cv.imshow("YOLO Camera", annotated)
+
+            key = cv.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                break
+
+        self.close()
+
+    # ------------------------------------------------------------------
+    def close(self):
+        """Освобождение ресурсов."""
+        if self.cap:
+            self.cap.release()
+        cv.destroyAllWindows()
 
 
-model = YOLO("yolov8s.pt")
-if torch.cuda.is_available():
-    model.to("cuda")
-
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        break
-
-    res = model(frame, conf=CONF, verbose=False)[0]
-    annotated = res.plot()  # BGR
-
-    cv.imshow("YOLO webcam", annotated)
-    # выход по Esc или 'q'
-    key = cv.waitKey(1) & 0xFF
-    if key == 27 or key == ord('q'):
-        break
-
-cap.release()
-cv.destroyAllWindows()
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    cam = YOLOCamera(cam_index=0, width=1280, height=720)
+    cam.run()
