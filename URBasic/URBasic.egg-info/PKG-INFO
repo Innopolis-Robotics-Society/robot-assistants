@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: URBasic
+Version: 0.1.0
+Summary: URBasic library for Universal Robots
+Author: Original Author
+Requires-Python: >=3.6
+Dynamic: author
+Dynamic: requires-python
+Dynamic: summary
