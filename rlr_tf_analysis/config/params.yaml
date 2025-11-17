@@ -1,0 +1,7 @@
+tf_analyzer:
+  ros__parameters:
+    camera_frame: "camera"
+    base_frame: "base_link"
+    max_age: 1.0
+    publish_markers: true
+    publish_corrected_tf: true 
