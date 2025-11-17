@@ -7,7 +7,6 @@ from typing import Optional, Tuple, Dict
 import time
 
 # ==== CONFIG ====
-# ==== CONFIG ====
 MODEL = "/home/ben/take/ur10-assistant/hoba/best_fixed.pt"
 CAM_INDEX = 0
 IMGZ = 640
