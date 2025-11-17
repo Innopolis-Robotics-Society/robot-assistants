@@ -1,0 +1,30 @@
+voice_controller:
+  ros__parameters:
+    # Robot connection parameters
+    robot_host: "192.168.0.100"
+    robot_port: 30002
+    
+    # Robot poses
+    waiting_pose: [-0.19, -0.315, 0.350, 2.783, -1.353, 0.03]
+    dog_pose: [-0.828, -0.624, 0.490, 2.003, -1.873, 0.08]
+    
+    looking_poses:
+      - [-0.22, -0.873, 1, 1.539, -0.749, 0.584]
+      - [0.185, -0.893, 1.1, 1.614, -0.831, 0.133]
+      - [-0.610, -0.650, 0.890, 1.607, -0.822, 0.750]
+      - [-0.228, -0.388, 1.26, 1.435, -0.730, 0.592]
+      - [-0.22, -0.873, 1, 1.539, -0.749, 0.584]
+    
+    hammer_poses:
+      - [-0.179, -1.036, 0.201, 2.853, -1.312, 0.106]
+      - [0.240, -1.025, 0.739, 2.007, -0.427, 0.861]
+    
+    # Audio parameters
+    sample_rate: 16000
+    audio_device: "default"
+    similarity_threshold: 0.7
+    
+    # Movement parameters
+    position_timeout: 15.0
+    position_check_interval: 0.05
+    pause_duration: 2.0
