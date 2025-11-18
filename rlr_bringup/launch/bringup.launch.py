@@ -41,23 +41,6 @@ def generate_launch_description():
         ],
     )
 
-    rlr_tf_analysis = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            [
-                PathJoinSubstitution(
-                    [
-                        FindPackageShare("rlr_tf_analysis"),
-                        "launch",
-                        "tf_analysis.launch.py",
-                    ]
-                )
-            ]
-        ),
-        launch_arguments=[
-        ],
-    )
-
-
     rviz = Node(
             package='rviz2',
             executable='rviz2',
@@ -71,7 +54,5 @@ def generate_launch_description():
     return LaunchDescription([
         camera_launch,
         april_tags_launch,
-        rlr_tf_analysis,
-        # goal,
         rviz
     ])

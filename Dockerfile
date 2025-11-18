@@ -63,6 +63,9 @@ RUN apt-get update && apt-get upgrade -y && \
     ros-${ROS_DISTRO}-urdf-tutorial \
     ros-${ROS_DISTRO}-v4l2-camera \
     ros-${ROS_DISTRO}-camera-calibration \
+    ros-${ROS_DISTRO}-apriltag-ros \
+    ros-${ROS_DISTRO}-image-pipeline \
+    ros-${ROS_DISTRO}-camera-calibration \
     libcanberra-gtk-module libcanberra-gtk3-module \
     at-spi2-core x11-apps xauth \
     libgflags-dev \

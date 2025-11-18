@@ -1,0 +1,4 @@
+string state     # 'open' | 'close' | 'free' | 'brake'
+---
+bool success
+string message
