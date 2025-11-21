@@ -14,51 +14,9 @@ x-common: &common-setup
   working_dir: /home/mobile/ros2_ws
 
 services:
-  fox:
-    <<: *common-setup
-    image: fabook/fox:jetson-v0.0.3
-    stdin_open: true
-    gpus: all
-    runtime: nvidia
-    tty: true
-    devices:
-      - /dev/video0:/dev/video0
-      - /dev/video1:/dev/video1
-    group_add:
-      - "video"
-      - "44"
-    command: [
-      "/bin/bash","-lc","
-      sudo chmod 666 /dev/ttyUSB* 2>/dev/null || true &&
-      sudo chmod 666 /dev/spidev* 2>/dev/null || true &&
-      sudo chmod 666 /dev/ttyACM* 2>/dev/null || true &&
-      exec bash"
-      ]
-
-  terminal-cuda:
-    <<: *common-setup
-    image: fabook/fox:v0.0.1
-    stdin_open: true
-    tty: true
-    gpus: all
-    runtime: nvidia
-    devices:
-      - /dev/video0:/dev/video0
-      - /dev/video1:/dev/video1
-    group_add:
-      - "video"
-      - "44"
-    command: [
-      "/bin/bash","-lc","
-      sudo chmod 666 /dev/ttyUSB* 2>/dev/null || true &&
-      sudo chmod 666 /dev/spidev* 2>/dev/null || true &&
-      sudo chmod 666 /dev/ttyACM* 2>/dev/null || true;
-      exec bash"
-      ]
-  
   terminal:
     <<: *common-setup
-    image: fabook/fox:v0.0.1
+    image: fabook/cv:v0.0.1
     stdin_open: true
     tty: true
     devices:
@@ -74,4 +32,3 @@ services:
       sudo chmod 666 /dev/ttyACM* 2>/dev/null || true;
       exec bash"
       ]
-# sudo -H python3 -m pip install --no-cache-dir "packaging==24.2"

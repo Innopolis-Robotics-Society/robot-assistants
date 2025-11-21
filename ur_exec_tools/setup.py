@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'ur10e_ros2'
+package_name = 'ur_exec_tools'
 
 setup(
     name=package_name,
@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'go_to_tf = ur_exec_tools.go_to_tf:main',
         ],
     },
 )
