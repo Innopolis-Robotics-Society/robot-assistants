@@ -66,10 +66,33 @@ def generate_launch_description():
         ]
     )
 
+    rlr_bringup = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("rlr_bringup"),
+                        "launch",
+                        "bringup.launch.py",
+                    ]
+                )
+            ]
+        ),
+        launch_arguments=[
+            ('ur_type', ur_model),
+            ('robot_ip', robot_ip),
+            ('kinematics_params_file', ur_cfg),
+            ('launch_rviz', 'false'),
+            ('headless_mode','true'),
+            ('use_tool_communication','false'),
+        ]
+    )
+
     return LaunchDescription([
         ur_model_arg,
         robot_ip_arg,
         ur_launch,
         moveit_launch,
+        rlr_bringup,
         #rviz
     ])

@@ -8,6 +8,8 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
 
+    rviz_cfg = PathJoinSubstitution([FindPackageShare("rlr_bringup"), "rviz", "hmm.rviz"])
+
     camera_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
@@ -44,6 +46,7 @@ def generate_launch_description():
     rviz = Node(
             package='rviz2',
             executable='rviz2',
+            arguments=['-d', rviz_cfg],
         )
 
     goal = Node(

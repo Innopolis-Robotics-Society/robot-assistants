@@ -3,22 +3,31 @@
 <package format="3">
   <name>ur_assist</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Helper nodes and services for UR10e with MoveIt2</description>
+
   <maintainer email="mobile@todo.todo">mobile</maintainer>
   <license>TODO: License declaration</license>
 
-  <member_of_group>rosidl_interface_packages</member_of_group>
-
+  <!-- build tools -->
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
-  <depend>rosidl_default_runtime</depend>
+  <!-- runtime for generated interfaces -->
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <!-- помечаем пакет как интерфейсный (есть свои srv) -->
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <!-- обычные зависимости -->
   <depend>rclcpp</depend>
-  <depend>moveit_ros_planning_interface</depend>
+  <depend>std_srvs</depend>
   <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>moveit_ros_planning_interface</depend>
+  <depend>moveit_core</depend>
 
-
-
+  <!-- тестовые зависимости -->
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

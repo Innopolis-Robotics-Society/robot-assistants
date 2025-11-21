@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            "hoba_xy_node = rlr_cv.rlr_cv:main",
+            "ins_search = rlr_cv.ins_search:main",
             "execute_rect_recognition = rlr_cv.april_tag_scale:main"
         ],
     },
