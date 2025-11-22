@@ -1,0 +1,34 @@
+x-common: &common-setup
+  network_mode: host
+  privileged: true
+  volumes:
+    - ${HOME}/.Xauthority:/home/mobile/.Xauthority:rw
+    - .:/home/mobile/ros2_ws/src:rw
+    - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    - /dev/dri:/dev/dri:rw
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics,display
+    - DISPLAY
+    - QT_X11_NO_MITSHM=1
+  working_dir: /home/mobile/ros2_ws
+
+services:
+  terminal:
+    <<: *common-setup
+    image: fabook/cv:v0.0.1
+    stdin_open: true
+    tty: true
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+    group_add:
+      - "video"
+      - "44"
+    command: [
+      "/bin/bash","-lc","
+      sudo chmod 666 /dev/ttyUSB* 2>/dev/null || true &&
+      sudo chmod 666 /dev/spidev* 2>/dev/null || true &&
+      sudo chmod 666 /dev/ttyACM* 2>/dev/null || true;
+      exec bash"
+      ]

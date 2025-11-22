@@ -1,0 +1,18 @@
+apriltag:
+  ros__parameters:
+    image_transport: raw
+    family: 36h11
+    size: 0.08 
+    profile: false
+    
+    detector:
+      threads: 4
+      decimate: 1.5
+      blur: 0.8
+      refine: true
+      sharpening: 0.25
+    
+    tag:
+      ids: [0, 1, 2, 3]
+      frames: ['marker0', 'marker1', 'marker2', 'marker3']  # Имена фреймов
+      sizes: [0.08, 0.08, 0.08, 0.08]  # Размеры маркеров

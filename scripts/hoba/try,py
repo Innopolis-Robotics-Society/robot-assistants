@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+import cv2 as cv
+import numpy as np
+from ultralytics import YOLO
+
+MODEL = "/home/ben/manip/best_fixed.pt"
+CAM_INDEX = 0
+IMGZ = 640
+
+def main():
+    # 1) снять кадр
+    cap = cv.VideoCapture(CAM_INDEX, cv.CAP_V4L2)
+    cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        print("Camera read failed"); return
+
+    # 2) один прогон YOLO
+    model = YOLO(MODEL)
+    res = model.predict(source=frame, imgsz=IMGZ, device="cpu", conf=0.25, verbose=False)[0]
+    if res.boxes is None or res.boxes.xyxy.numel() == 0:
+        cv.imshow("frame (no detections)", frame); cv.waitKey(0); return
+
+    # 3) только лучший бокс
+    idx = int(res.boxes.conf.argmax().item())
+    box = res.boxes.xyxy[idx].cpu().numpy().astype(int)
+    cls = int(res.boxes.cls[idx].item())
+    name = model.names.get(cls, str(cls))
+
+    H, W = frame.shape[:2]
+    x1,y1,x2,y2 = box
+    x1 = max(0, min(x1, W-1)); x2 = max(0, min(x2, W-1))
+    y1 = max(0, min(y1, H-1)); y2 = max(0, min(y2, H-1))
+    if x2 <= x1 or y2 <= y1:
+        cv.imshow("frame (invalid bbox)", frame); cv.waitKey(0); return
+
+    roi = frame[y1:y2, x1:x2].copy()
+
+    # 4) Otsu на канале насыщенности S: белый фон и его тени имеют низкую S
+    hsv = cv.cvtColor(roi, cv.COLOR_BGR2HSV)
+    S = hsv[..., 1]
+    # Можно слегка размыть для устойчивости, но вы просили "только Otsu":
+    # S = cv.GaussianBlur(S, (5,5), 0)
+    _, mask = cv.threshold(S, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+    # 5) предпросмотр вырезки
+    cut = cv.bitwise_and(roi, roi, mask=mask)
+
+    # 6) показать
+    vis = frame.copy()
+    cv.rectangle(vis, (x1,y1), (x2,y2), (0,255,0), 2)
+    cv.putText(vis, f"{name}", (x1, max(0,y1-6)), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv.LINE_AA)
+
+    cv.imshow("frame + bbox", vis)
+    cv.imshow("roi", roi)
+    cv.imshow("mask_otsu_on_S", mask)
+    cv.imshow("cutout", cut)
+    cv.waitKey(0)
+    cv.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
