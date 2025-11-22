@@ -158,21 +158,6 @@ def _snap_inside(cx: float, cy: float, mask_u8: np.ndarray, erode_iters: int = 1
     return float(pts[j, 0]), float(pts[j, 1])
 
 
-def quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
-    """Преобразование кватерниона (x,y,z,w) в матрицу поворота 3x3."""
-    x, y, z, w = qx, qy, qz, qw
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-    wx, wy, wz = w * x, w * y, w * z
-
-    R = np.array([
-        [1.0 - 2.0 * (yy + zz),     2.0 * (xy - wz),         2.0 * (xz + wy)],
-        [2.0 * (xy + wz),           1.0 - 2.0 * (xx + zz),   2.0 * (yz - wx)],
-        [2.0 * (xz - wy),           2.0 * (yz + wx),         1.0 - 2.0 * (xx + yy)],
-    ], dtype=np.float64)
-    return R
-
-
 # ---------- main API (детекция в изображении) ----------
 def measure_pixel_once(
     frame: np.ndarray,
@@ -255,9 +240,9 @@ class XYMeasureNode(Node):
         self.declare_parameter("display", False)
         self.declare_parameter("publish_rate", 1.0)
 
-        # ВАЖНО: твой фрейм камеры
-        self.declare_parameter("frame_id", "camera")          # у тебя камера = "camera"
-        self.declare_parameter("marker_frame_id", "marker1")  # AprilTag фрейм
+        # твой фрейм камеры и маркера
+        self.declare_parameter("frame_id", "camera")          # камера
+        self.declare_parameter("marker_frame_id", "marker1")  # AprilTag
         self.declare_parameter("target_frame_id", "hoba_target")
 
         self.declare_parameter("use_grayworld", False)
@@ -343,12 +328,15 @@ class XYMeasureNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to convert image: {e}")
 
-    def _compute_3d_on_table(self, u_px: float, v_px: float) -> Optional[np.ndarray]:
+    def _compute_3d_on_table_and_orientation(
+        self, u_px: float, v_px: float
+    ) -> Optional[Tuple[np.ndarray, Tuple[float, float, float, float]]]:
         """
-        Пересечение луча из пикселя (u,v) с плоскостью стола, заданной AprilTag marker1.
+        Пересечение луча из пикселя (u,v) с плоскостью стола, заданной AprilTag marker1,
+        плюс ориентация: Z-ось как у маркера (нормаль стола), yaw по маркеру.
 
         Используем TF: camera -> marker1.
-        Считаем, что плоскость стола совпадает с плоскостью XY маркера (ось Z маркера — нормаль).
+        Считаем, что плоскость стола совпадает с плоскостью XY маркера.
         """
         try:
             # transform: camera (target) <- marker1 (source)
@@ -368,14 +356,18 @@ class XYMeasureNode(Node):
         # точка на плоскости стола (origin маркера) в системе камеры
         p0 = np.array([t.x, t.y, t.z], dtype=np.float64)
 
-        # нормаль к плоскости стола в системе камеры: R * [0,0,1]
-        R = quat_to_rot(q.x, q.y, q.z, q.w)
-        n = R @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        # нормаль к плоскости стола в системе камеры: Z-ось маркера
+        # (сама ориентация нам не нужна для пересечения, только для нормали)
+        # но yaw/ориентацию целиком мы просто возьмём из q
+        # -> это гарантирует: ось Z строго как у маркера, yaw как у маркера.
+        # Для пересечения: n = R * [0,0,1]
+        # Можно явно не строить R, достаточно использовать q только для TF цели.
+        # Тут всё же построим R для нормали.
+        n = self._quat_z_axis(q)
 
         # луч из камеры (камера в начале координат)
         uv1 = np.array([u_px, v_px, 1.0], dtype=np.float64)
         ray = K_INV @ uv1  # направление в координатах камеры
-        # нормализуем для стабильности (не обязательно, но аккуратнее)
         ray_norm = ray / np.linalg.norm(ray)
 
         num = np.dot(n, p0)
@@ -390,7 +382,25 @@ class XYMeasureNode(Node):
             return None
 
         X_cam = s * ray_norm  # 3D точка на плоскости стола в системе камеры
-        return X_cam
+
+        # ориентация берём ровно как у маркера: Z-ось вверх, yaw как у AprilTag
+        quat = (q.x, q.y, q.z, q.w)
+        return X_cam, quat
+
+    @staticmethod
+    def _quat_z_axis(q) -> np.ndarray:
+        """Вернуть Z-ось (0,0,1) маркера, выраженную в системе камеры."""
+        x, y, z, w = q.x, q.y, q.z, q.w
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+
+        # R * (0,0,1) = третий столбец R
+        # R как в стандартной формуле quat->R
+        R_02 = 2.0 * (xz + wy)
+        R_12 = 2.0 * (yz - wx)
+        R_22 = 1.0 - 2.0 * (xx + yy)
+        return np.array([R_02, R_12, R_22], dtype=np.float64)
 
     def timer_cb(self):
         if self.last_frame is None:
@@ -418,13 +428,15 @@ class XYMeasureNode(Node):
 
         u_px, v_px, vis = res
 
-        # --- 3D точка через плоскость стола (marker1) ---
-        X_cam = self._compute_3d_on_table(u_px, v_px)
-        if X_cam is None:
-            self.get_logger().debug("Failed to compute 3D point on table")
+        # --- 3D точка + ориентация через плоскость стола и AprilTag ---
+        out = self._compute_3d_on_table_and_orientation(u_px, v_px)
+        if out is None:
+            self.get_logger().debug("Failed to compute 3D point / orientation")
             return
 
+        X_cam, quat = out
         x_m, y_m, z_m = float(X_cam[0]), float(X_cam[1]), float(X_cam[2])
+        qx, qy, qz, qw = quat
 
         # --- PointStamped в фрейме камеры ---
         msg = PointStamped()
@@ -452,19 +464,21 @@ class XYMeasureNode(Node):
 
         t.transform.translation.x = x_m
         t.transform.translation.y = y_m
-        t.transform.translation.z = z_m - 0.08
+        t.transform.translation.z = z_m - 0.06
 
-        # Пока ориентация = как у камеры (единичный кватернион)
-        t.transform.rotation.x = 0.0
-        t.transform.rotation.y = 0.0
-        t.transform.rotation.z = 0.0
-        t.transform.rotation.w = 1.0
+        # ориентация РОВНО как у маркера:
+        # Z-ось строго вверх (нормаль к столу), yaw как у AprilTag
+        t.transform.rotation.x = qx
+        t.transform.rotation.y = qy
+        t.transform.rotation.z = qz
+        t.transform.rotation.w = qw
 
         self.tf_broadcaster.sendTransform(t)
 
         self.get_logger().debug(
             f"Published 3D & TF: ({x_m:.4f}, {y_m:.4f}, {z_m:.4f}) "
-            f"in {self.frame_id} -> {self.target_frame_id}"
+            f"in {self.frame_id} -> {self.target_frame_id}, "
+            f"orientation from marker {self.marker_frame_id}"
         )
 
 

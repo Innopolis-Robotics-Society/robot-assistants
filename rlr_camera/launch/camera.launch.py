@@ -46,7 +46,7 @@ def generate_launch_description():
     tf = Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            arguments=['0', '0', '0.06', '0', '0', '-1.57', 'tool0_controller', 'camera']
+            arguments=['0', '0.059', '0.0', '0', '3.14', '0', 'tool0_controller', 'camera']
         )
 
     return LaunchDescription([

@@ -66,6 +66,22 @@ def generate_launch_description():
         ]
     )
 
+    tf = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("ur_assist"),
+                        "launch",
+                        "tf.launch.py",
+                    ]
+                )
+            ]
+        ),
+        launch_arguments=[
+        ]
+    )
+
     rlr_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
@@ -91,6 +107,7 @@ def generate_launch_description():
     return LaunchDescription([
         ur_model_arg,
         robot_ip_arg,
+        tf,
         ur_launch,
         moveit_launch,
         rlr_bringup,

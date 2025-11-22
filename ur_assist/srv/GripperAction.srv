@@ -1,0 +1,4 @@
+bool open   # true = открыть, false = закрыть
+---
+bool success
+string message
