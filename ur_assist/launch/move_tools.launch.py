@@ -42,7 +42,7 @@ def generate_launch_description():
         ],
     )
 
-    exec_ik_move = Node(
+    gripper_control = Node(
         package="ur_assist",
         executable="gripper_control",
         output="screen",
@@ -56,4 +56,5 @@ def generate_launch_description():
         ins_search,
         go_to_frame,
         exec_ik_move,
+        gripper_control
     ])

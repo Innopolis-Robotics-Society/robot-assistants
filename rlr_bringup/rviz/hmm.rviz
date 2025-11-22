@@ -6,6 +6,7 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
+        - /Image1
       Splitter Ratio: 0.5
     Tree Height: 344
   - Class: rviz_common/Selection
@@ -66,9 +67,13 @@ Visualization Manager:
           Value: true
         ft_frame:
           Value: true
-        shoulder_link:
+        hoba_target:
           Value: true
-        target_tf:
+        marker1:
+          Value: true
+        nad:
+          Value: true
+        shoulder_link:
           Value: true
         tool0:
           Value: true
@@ -95,7 +100,10 @@ Visualization Manager:
             base:
               tool0_controller:
                 camera:
-                  {}
+                  hoba_target:
+                    {}
+                  marker1:
+                    {}
             base_link_inertia:
               shoulder_link:
                 upper_arm_link:
@@ -108,8 +116,8 @@ Visualization Manager:
                               {}
                           ft_frame:
                             {}
-            target_tf:
-              {}
+          nad:
+            {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Image
@@ -124,7 +132,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /image_rect
+        Value: /hoba/debug_image
       Value: true
   Enabled: true
   Global Options:
@@ -172,7 +180,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 4.479902267456055
+      Distance: 2.6865763664245605
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -187,10 +195,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.33039844036102295
+      Pitch: 0.33039847016334534
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 0.665398120880127
+      Yaw: 6.1185808181762695
     Saved: ~
 Window Geometry:
   Displays:
@@ -210,5 +218,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 2438
-  X: 140
-  Y: 60
+  X: 184
+  Y: 1197

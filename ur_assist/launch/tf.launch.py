@@ -14,7 +14,8 @@ def static_tf(name, x,y,z, r,p,yaw, parent, child):
     )
 
 def generate_launch_description():
-    nad = static_tf('nad', 0.059, 0.564, 0.626, 0.0, 0.0, 0.0, 'world', 'nad')
+    nad = static_tf('nad', 0.059, 0.564, 0.626, 0.0, 0.0, 1.5706, 'world', 'nad')
+    vpered = static_tf('nad', 0.059, 0.564, 0.626, 1.5706, 0.0, 0.0, 'world', 'vpered')
 
     return LaunchDescription([
         nad,
