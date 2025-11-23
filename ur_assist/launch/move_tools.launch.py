@@ -52,6 +52,16 @@ def generate_launch_description():
         ],
     )
 
+    water_proc = Node(
+        package="voice_controlled_robot",
+        executable="water_proc",
+        output="screen",
+        parameters=[
+            {
+            },
+        ],
+    )
+
     rlr_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
@@ -88,5 +98,6 @@ def generate_launch_description():
         exec_ik_move,
         gripper_control,
         rlr_bringup,
-        voice_rec
+        voice_rec,
+        water_proc
     ])

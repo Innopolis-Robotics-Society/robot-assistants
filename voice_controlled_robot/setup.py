@@ -41,6 +41,7 @@ setup(
     entry_points={
         'console_scripts': [
             'voice_controller = voice_controlled_robot.nodes.voice_controller:main',
+            'water_proc = voice_controlled_robot.nodes.water_proc:main',
         ],
     },
 )

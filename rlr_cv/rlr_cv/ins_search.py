@@ -577,7 +577,7 @@ class XYMeasureNode(Node):
         t.child_frame_id = self.target_frame_id
 
         t.transform.translation.x = x_m
-        t.transform.translation.y = y_m - 0.02  # твой эмпирический сдвиг
+        t.transform.translation.y = y_m - 0.0  # твой эмпирический сдвиг
         t.transform.translation.z = z_m + self.z_offset
 
         # ориентация РОВНО как у маркера:
