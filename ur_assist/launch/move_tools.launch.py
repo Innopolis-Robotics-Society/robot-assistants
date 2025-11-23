@@ -42,7 +42,7 @@ def generate_launch_description():
         ],
     )
 
-    exec_ik_move = Node(
+    gripper_control = Node(
         package="ur_assist",
         executable="gripper_control",
         output="screen",
@@ -52,8 +52,52 @@ def generate_launch_description():
         ],
     )
 
+    water_proc = Node(
+        package="voice_controlled_robot",
+        executable="water_proc",
+        output="screen",
+        parameters=[
+            {
+            },
+        ],
+    )
+
+    rlr_bringup = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("rlr_bringup"),
+                        "launch",
+                        "bringup.launch.py",
+                    ]
+                )
+            ]
+        ),
+        launch_arguments=[
+        ]
+    )
+
+    voice_rec = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("voice_controlled_robot"),
+                        "launch",
+                        "voice_control.launch.py",
+                    ]
+                )
+            ]
+        ),
+    )
+
     return LaunchDescription([
         ins_search,
         go_to_frame,
         exec_ik_move,
+        gripper_control,
+        rlr_bringup,
+        voice_rec,
+        water_proc
     ])

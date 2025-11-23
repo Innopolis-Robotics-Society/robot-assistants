@@ -1,6 +1,7 @@
 #include <memory>
 #include <string>
 #include <chrono>
+#include <future>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -12,6 +13,8 @@
 
 #include "ur_assist/srv/move_to_pose.hpp"
 #include "ur_assist/srv/go_to_frame.hpp"
+
+#include "rmw/qos_profiles.h"
 
 using namespace std::chrono_literals;
 
@@ -35,9 +38,16 @@ int main(int argc, char** argv)
   auto tf_buffer   = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
 
-  // Клиент к уже существующему сервису go_to_tf (MoveToPose)
+  // Отдельная callback-группа для клиента go_to_tf (Reentrant)
+  auto client_group = node->create_callback_group(
+      rclcpp::CallbackGroupType::Reentrant);
+
+  // Клиент к сервису go_to_tf (MoveToPose) в отдельной группе
   using MoveToPose = ur_assist::srv::MoveToPose;
-  auto go_to_tf_client = node->create_client<MoveToPose>("go_to_tf");
+  auto go_to_tf_client = node->create_client<MoveToPose>(
+      "go_to_tf",
+      rmw_qos_profile_services_default,
+      client_group);
 
   // Вспомогательная функция ожидания TF
   auto getTransform =
@@ -106,18 +116,40 @@ int main(int argc, char** argv)
       auto move_req = std::make_shared<MoveToPose::Request>();
       move_req->target = target_pose;
 
-      // 5. Отправляем запрос (fire-and-forget)
-      go_to_tf_client->async_send_request(move_req);
+      // 5. Отправляем запрос и ЖДЁМ результат
+      auto future = go_to_tf_client->async_send_request(move_req);
+
+      // Ждём завершения с таймаутом
+      auto status = future.wait_for(300s);  // можно уменьшить, если хочешь
+
+      if (status != std::future_status::ready) {
+        RCLCPP_ERROR(node->get_logger(),
+                     "Timeout waiting for response from 'go_to_tf'");
+        response->success = false;
+        response->message = "Timeout waiting for go_to_tf";
+        return;
+      }
+
+      auto move_resp = future.get();
+      if (!move_resp->success) {
+        RCLCPP_WARN(node->get_logger(),
+                    "go_to_tf returned failure: %s",
+                    move_resp->message.c_str());
+        response->success = false;
+        response->message = "go_to_tf failed: " + move_resp->message;
+        return;
+      }
 
       RCLCPP_INFO(node->get_logger(),
-                  "Sent request to 'go_to_tf' with pose from frame '%s'", frame.c_str());
+                  "go_to_tf finished successfully for frame '%s'", frame.c_str());
 
       response->success = true;
-      response->message = "Request sent to go_to_tf";
+      response->message = "OK";
     });
 
   RCLCPP_INFO(logger, "Service /go_to_frame is ready");
 
+  // Важно: MultiThreadedExecutor, чтобы группы могли реально параллелиться
   rclcpp::executors::MultiThreadedExecutor exec;
   exec.add_node(node);
   exec.spin();

@@ -18,7 +18,8 @@ def generate_launch_description():
             ('image', '/image_raw'),
             ('camera_info', '/camera_info'),
             ('image_rect', 'image_rect')
-        ]
+        ],
+        arguments=['--ros-args', '--log-level', 'error']
     )
   
     apriltag_node = Node(
@@ -29,7 +30,8 @@ def generate_launch_description():
         remappings=[
             ('image_rect', '/image_rect'),
             ('camera_info', '/camera_info')
-        ]
+        ],
+        arguments=['--ros-args', '--log-level', 'error']
     )
     
     return LaunchDescription([

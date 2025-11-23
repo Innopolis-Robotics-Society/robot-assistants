@@ -80,10 +80,20 @@ RUN apt-get update && apt-get upgrade -y && \
     at-spi2-core \
     x11-apps \
     xauth \
+    alsa-utils \
+    pulseaudio \
+    python3-pip \
+    portaudio19-dev \
     --fix-missing
 
 RUN python3 -m pip install --no-cache-dir --upgrade pip \
- && python3 -m pip install --no-cache-dir onnxruntime==1.18.1 ultralytics
+ && python3 -m pip install --no-cache-dir \ 
+    onnxruntime==1.18.1 \
+    ultralytics \
+    "numpy<2" \
+    sounddevice \
+    vosk \
+    pyaudio 
 
 # Clean up
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*

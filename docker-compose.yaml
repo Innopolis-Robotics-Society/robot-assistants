@@ -6,22 +6,25 @@ x-common: &common-setup
     - .:/home/mobile/ros2_ws/src:rw
     - /tmp/.X11-unix:/tmp/.X11-unix:rw
     - /dev/dri:/dev/dri:rw
+    - /run/user/1000/pulse:/run/user/1000/pulse
   environment:
     - NVIDIA_VISIBLE_DEVICES=all
     - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics,display
     - DISPLAY
     - QT_X11_NO_MITSHM=1
+    - PULSE_SERVER=unix:/run/user/1000/pulse/native
   working_dir: /home/mobile/ros2_ws
 
 services:
   terminal:
     <<: *common-setup
-    image: fabook/cv:v0.0.1
+    image: fabook/cv:v0.0.2
     stdin_open: true
     tty: true
     devices:
       - /dev/video0:/dev/video0
       - /dev/video1:/dev/video1
+      - /dev/snd:/dev/snd
     group_add:
       - "video"
       - "44"
