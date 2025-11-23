@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'go_to_tf = ur_voice_controller.voice_beh:main',
+            'voice_beh = ur_voice_controller.voice_beh:main',
         ],
     },
 )

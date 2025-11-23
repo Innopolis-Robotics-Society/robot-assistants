@@ -10,14 +10,10 @@ from ultralytics import YOLO
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
-from rclpy.duration import Duration
-
 from geometry_msgs.msg import PointStamped, TransformStamped
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 from tf2_ros import TransformBroadcaster, Buffer, TransformListener, TransformException
-
-from ur_assist.srv import DetectObject
 
 # ==== CONFIG ====
 THIS_DIR = Path(__file__).resolve().parent
@@ -156,7 +152,6 @@ def _snap_inside(cx: float, cy: float, mask_u8: np.ndarray, erode_iters: int = 1
 def measure_pixel_once(
     frame: np.ndarray,
     *,
-    target_class: Optional[str] = None,
     display: bool = False,
     device: str = "cpu",
     s_p: int = 90, v_p: int = 60, s_off: int = 5,
@@ -169,7 +164,6 @@ def measure_pixel_once(
     """
     На вход: готовый кадр (BGR, rectified).
     На выход: пиксельные координаты центра объекта (u,v) + debug-изображение.
-    Если задан target_class, берём только боксы соответствующего класса.
     """
     if frame is None:
         return None
@@ -179,47 +173,11 @@ def measure_pixel_once(
 
     model = _get_model()
     res = model.predict(source=frame, imgsz=IMGZ, device=device, conf=0.25, verbose=False)[0]
-    boxes = res.boxes
-
-    if boxes is None or boxes.xyxy.numel() == 0:
+    if res.boxes is None or res.boxes.xyxy.numel() == 0:
         return None
 
-    # подготовка имён классов
-    names_raw = model.names
-    if isinstance(names_raw, dict):
-        id2name = {int(k): str(v) for k, v in names_raw.items()}
-    else:
-        id2name = {i: str(n) for i, n in enumerate(names_raw)}
-
-    target_class_id: Optional[int] = None
-    if target_class is not None:
-        tc = target_class.strip().lower()
-        for cid, cname in id2name.items():
-            if cname.lower() == tc:
-                target_class_id = cid
-                break
-        if target_class_id is None:
-            # запрошенного класса нет в модели
-            print(f"[hoba_xy_measure] target class '{target_class}' not in model.names")
-            return None
-
-    # выбор бокса: либо лучший по conf для нужного класса, либо общий лучший
-    conf = boxes.conf.detach().cpu().numpy()
-    cls_ids = None
-    if boxes.cls is not None:
-        cls_ids = boxes.cls.detach().cpu().numpy().astype(int)
-
-    if target_class_id is not None and cls_ids is not None:
-        mask = (cls_ids == target_class_id)
-        indices = np.where(mask)[0]
-        if indices.size == 0:
-            return None
-        best_local = conf[indices].argmax()
-        idx = int(indices[best_local])
-    else:
-        idx = int(conf.argmax())
-
-    x1, y1, x2, y2 = boxes.xyxy[idx].detach().cpu().numpy().astype(int)
+    idx = int(res.boxes.conf.argmax().item())
+    x1, y1, x2, y2 = res.boxes.xyxy[idx].detach().cpu().numpy().astype(int)
     x1, y1, x2, y2 = _expand_box(x1, y1, x2, y2, Wimg, Himg)
     if x2 <= x1 or y2 <= y1:
         return None
@@ -278,7 +236,7 @@ class XYMeasureNode(Node):
         self.declare_parameter("target_frame_id", "hoba_target")
 
         # смещение по Z от плоскости стола (например, до центра инструмента)
-        self.declare_parameter("z_offset", -0.080)
+        self.declare_parameter("z_offset", -0.082)
 
         # камера
         self.declare_parameter("use_grayworld", False)
@@ -362,18 +320,6 @@ class XYMeasureNode(Node):
         self.pub_xy = self.create_publisher(PointStamped, "hoba/xy", 10)
         self.pub_debug = self.create_publisher(Image, "hoba/debug_image", 10)
 
-        # сервис
-        self.srv = self.create_service(
-            DetectObject,
-            "detect_object",
-            self.handle_detect_object,
-        )
-
-        # состояние режима отслеживания
-        self.active: bool = False
-        self.active_class: Optional[str] = None
-        self.active_until: Optional[Time] = None  # None = бесконечно
-
         # таймер
         self.timer = self.create_timer(period, self.timer_cb)
 
@@ -384,31 +330,6 @@ class XYMeasureNode(Node):
             f"model_path={self.model_path}, target_frame_id={self.target_frame_id}, "
             f"z_offset={self.z_offset}"
         )
-
-    def handle_detect_object(self, req: DetectObject.Request, resp: DetectObject.Response) -> DetectObject.Response:
-        class_name = req.class_name.strip()
-        if not class_name:
-            resp.accepted = False
-            resp.message = "class_name is empty"
-            return resp
-
-        self.active_class = class_name
-        if req.duration > 0.0:
-            self.active_until = self.get_clock().now() + Duration(seconds=float(req.duration))
-        else:
-            self.active_until = None  # бесконечно
-
-        self.active = True
-
-        if req.duration > 0.0:
-            msg = f"Tracking '{class_name}' for {req.duration:.2f} s"
-        else:
-            msg = f"Tracking '{class_name}' until node is stopped"
-
-        resp.accepted = True
-        resp.message = msg
-        self.get_logger().info(msg)
-        return resp
 
     def camera_info_cb(self, msg: CameraInfo):
         """Обновление матрицы K из /camera_info."""
@@ -506,23 +427,12 @@ class XYMeasureNode(Node):
         return X_cam, quat
 
     def timer_cb(self):
-        # режим отслеживания выключен
-        if not self.active:
-            return
-
-        # время истекло
-        if self.active_until is not None and self.get_clock().now() > self.active_until:
-            self.active = False
-            self.get_logger().info("Detection window expired")
-            return
-
         if self.last_frame is None:
             self.get_logger().debug("No image received yet")
             return
 
         res = measure_pixel_once(
             self.last_frame,
-            target_class=self.active_class,
             display=self.display,
             device=self.device,
             s_p=self.s_p,
@@ -537,7 +447,7 @@ class XYMeasureNode(Node):
         )
 
         if res is None:
-            self.get_logger().debug("No detection for active class")
+            self.get_logger().debug("No detection / measurement failed")
             return
 
         u_px, v_px, vis = res
@@ -558,7 +468,7 @@ class XYMeasureNode(Node):
         msg.header.frame_id = self.frame_id
         msg.point.x = x_m
         msg.point.y = y_m
-        msg.point.z = z_m + self.z_offset  # смещение по Z до центра инструмента
+        msg.point.z = z_m + self.z_offset  # при желании смещаем по Z (например, до центра инструмента)
 
         self.pub_xy.publish(msg)
 
@@ -577,7 +487,7 @@ class XYMeasureNode(Node):
         t.child_frame_id = self.target_frame_id
 
         t.transform.translation.x = x_m
-        t.transform.translation.y = y_m - 0.02  # твой эмпирический сдвиг
+        t.transform.translation.y = y_m - 0.02
         t.transform.translation.z = z_m + self.z_offset
 
         # ориентация РОВНО как у маркера:
@@ -590,9 +500,9 @@ class XYMeasureNode(Node):
         self.tf_broadcaster.sendTransform(t)
 
         self.get_logger().debug(
-            f"Published 3D & TF for '{self.active_class}': "
-            f"({x_m:.4f}, {y_m:.4f}, {z_m + self.z_offset:.4f}) "
-            f"in {self.frame_id} -> {self.target_frame_id}"
+            f"Published 3D & TF: ({x_m:.4f}, {y_m:.4f}, {z_m + self.z_offset:.4f}) "
+            f"in {self.frame_id} -> {self.target_frame_id}, "
+            f"orientation from marker {self.marker_frame_id}"
         )
 
 

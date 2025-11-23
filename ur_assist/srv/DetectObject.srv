@@ -1,0 +1,5 @@
+string class_name   # имя класса как в model.names (например "hammer")
+float32 duration    # сколько секунд отслеживать; <=0 = бесконечно
+---
+bool accepted
+string message

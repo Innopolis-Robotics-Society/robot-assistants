@@ -15,8 +15,8 @@ def static_tf(name, x,y,z, r,p,yaw, parent, child):
 
 def generate_launch_description():
     nad = static_tf('nad', 0.059, 0.75, 0.60, 0.0, 0.0, 1.5706, 'world', 'pose_up')
-    podat = static_tf('podat', 0.0, 0.2, 0.25, 1.5706, -1.5706, 0.0, 'world', 'pose_podat')
-    forward = static_tf('forward', 0.059, 0.664, 0.526, 1.5706, -1.5706, 0.0, 'world', 'pose_forward')
+    podat = static_tf('podat', 0.459, 0.664, 0.526, 1.5706, -1.5706, -0.86, 'world', 'pose_podat')
+    forward = static_tf('forward', 0.059, 0.664, 0.40, 1.5706, -1.5706, 0.0, 'world', 'pose_forward')
 
     return LaunchDescription([
         nad,

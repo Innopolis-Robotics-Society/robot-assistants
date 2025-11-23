@@ -12,7 +12,7 @@ from std_msgs.msg import String
 
 from tf2_ros import Buffer, TransformListener
 
-from ur_assist.srv import GripperAction, GoToFrame
+from ur_assist.srv import GripperAction, GoToFrame, DetectObject
 
 
 class VoiceCommandExecutor(Node):
@@ -21,12 +21,13 @@ class VoiceCommandExecutor(Node):
     запускает сценарий движения манипулятора через сервисы:
       - /gripper_action (ur_assist/srv/GripperAction)
       - /go_to_frame   (ur_assist/srv/GoToFrame)
+      - /detect_object (ur_assist/srv/DetectObject)
 
-    Архитектура:
-      - очередь сценариев (command -> list шагов)
-      - один активный сценарий
-      - выполнение шагов через асинхронные сервисные вызовы
-        и периодический таймер.
+    Шаги сценария:
+      - ('go', frame_name)
+      - ('gripper', True/False)
+      - ('detect', class_name, duration)
+      - ('wait', seconds)
     """
 
     def __init__(self):
@@ -49,6 +50,12 @@ class VoiceCommandExecutor(Node):
                 ('up_frame', 'pose_up'),
                 ('forward_frame', 'pose_forward'),
 
+                # Для сценария с детекцией отвертки
+                ('screwdriver_frame', 'screwdriver'),
+
+                # Сколько секунд трекать объект в detect_object
+                ('detect_duration', 10.0),
+
                 # Если False — игнорировать новые команды, пока идёт сценарий
                 ('queue_commands', False),
             ]
@@ -57,7 +64,6 @@ class VoiceCommandExecutor(Node):
         self.base_frame = self.get_parameter('base_frame').value
         self.home_frame = self.get_parameter('home_frame').value
         self.podat_frame = self.get_parameter('podat_frame').value
-
 
         self.hammer_pick_frame = self.get_parameter('hammer_pick_frame').value
         self.hammer_place_frame = self.get_parameter('hammer_place_frame').value
@@ -68,6 +74,9 @@ class VoiceCommandExecutor(Node):
         self.up_frame = self.get_parameter('up_frame').value
         self.forward_frame = self.get_parameter('forward_frame').value
 
+        self.screwdriver_frame = self.get_parameter('screwdriver_frame').value
+        self.detect_duration = float(self.get_parameter('detect_duration').value)
+
         self.queue_commands = bool(self.get_parameter('queue_commands').value)
 
         # TF
@@ -75,18 +84,21 @@ class VoiceCommandExecutor(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Сценарии: список шагов (тип, аргументы)
-        # тип: "go" или "gripper"
+        # тип шага: "go", "gripper", "detect", "wait"
         self.scenarios = self._build_scenarios()
 
         # Клиенты к сервисам
         self.gripper_client = self.create_client(GripperAction, '/gripper_action')
         self.goto_client = self.create_client(GoToFrame, '/go_to_frame')
+        self.detect_client = self.create_client(DetectObject, '/detect_object')
 
         # Ждём сервисы на старте (блокирующе, но до spin это нормально)
         self.get_logger().info('Ожидание сервиса /gripper_action ...')
         self.gripper_client.wait_for_service()
         self.get_logger().info('Ожидание сервиса /go_to_frame ...')
         self.goto_client.wait_for_service()
+        self.get_logger().info('Ожидание сервиса /detect_object ...')
+        self.detect_client.wait_for_service()
         self.get_logger().info('Сервисы доступны')
 
         # Подписчик на распознанные команды
@@ -108,6 +120,9 @@ class VoiceCommandExecutor(Node):
         self.current_future = None        # Future сервисного вызова
         self.cancel_requested = False     # флаг остановки
 
+        # Для шага "wait"
+        self.wait_until = None            # rclpy.time.Time, когда ожидание заканчивается
+
         # Таймер "тикера" сценариев
         self.tick_timer = self.create_timer(0.05, self._tick)
 
@@ -120,24 +135,35 @@ class VoiceCommandExecutor(Node):
         """
         scenarios = {}
 
+        # Молоток: подняться, открыть хват, включить детекцию,
+        # подождать, поехать к найденному фрейму, схватить, подать.
         scenarios['молоток'] = [
             ('go', self.up_frame),
-            ('gripper', True),   # открыть
-            ('go', self.hammer_pick_frame),
-            ('gripper', False),  # закрыть
-            ('go', self.hammer_place_frame),
+            ('gripper', True),                             # открыть
+            ('detect', 'hammer', self.detect_duration),    # вызвать /detect_object
+            ('wait', 3.0),                                 # подождать 3 секунды
+            ('go', self.hammer_pick_frame),                # сюда должен публиковаться TF от детектора
+            ('gripper', False),                            # закрыть
+            ('go', self.up_frame),
+        ]
+
+        # Пример для отвертки (если нужно)
+        scenarios['отвёртка'] = [
+            ('go', self.up_frame),
+            ('gripper', True),
+            ('detect', 'screwdriver', self.detect_duration),
+            ('wait', 3.0),
+            ('go', self.screwdriver_frame),
+            ('gripper', False),
+            ('go', self.up_frame),
+        ]
+
+        # Простейшие команды
+        scenarios['поднеси'] = [
             ('go', self.podat_frame),
         ]
 
-        # # Сценарий "воды"
-        # scenarios['воды'] = [
-        #     ('go', self.water_pick_frame),
-        #     ('gripper', False),
-        #     ('go', self.water_place_frame),
-        #     ('gripper', True),
-        #     ('go', self.home_frame),
-        # ]
-
+        # Простейшие команды
         scenarios['вперед'] = [
             ('go', self.forward_frame),
         ]
@@ -166,7 +192,8 @@ class VoiceCommandExecutor(Node):
         Если трансформа нет — пишет warning и возвращает False.
         """
         try:
-            # Time() с нулевым временем — "latest"
+            # Time() с нулевым временем — "latest".
+            # Можно оставить timeout=0.0, раз ожидание выносим в шаг 'wait'.
             ok = self.tf_buffer.can_transform(
                 self.base_frame,
                 frame,
@@ -249,6 +276,7 @@ class VoiceCommandExecutor(Node):
         self.current_step_index = 0
         self.current_future = None
         self.cancel_requested = False
+        self.wait_until = None
 
         self.get_logger().info(f'Запуск сценария для команды "{command_name}"')
         self._publish_status(f'start:{command_name}')
@@ -290,9 +318,38 @@ class VoiceCommandExecutor(Node):
         elif step_type == 'gripper':
             open_flag = bool(step[1])
             self._call_gripper(open_flag)
+
+        elif step_type == 'detect':
+            # step: ('detect', class_name, duration)
+            class_name = step[1]
+            duration = step[2] if len(step) > 2 else self.detect_duration
+            self._call_detect_object(class_name, duration)
+
+        elif step_type == 'wait':
+            duration = float(step[1]) if len(step) > 1 else 0.0
+            self._start_wait(duration)
+
         else:
             self.get_logger().error(f'Неизвестный тип шага: {step_type}')
             self._abort_current_scenario(reason=f'unknown_step_type:{step_type}')
+
+    def _start_wait(self, duration: float):
+        """
+        Инициализация шага ожидания.
+        """
+        if duration <= 0.0:
+            self.get_logger().info(
+                f'Шаг {self.current_step_index}: wait({duration} s) — пропускаю (<=0)'
+            )
+            # Сразу переходим к следующему шагу
+            self.current_step_index += 1
+            self._start_next_step()
+            return
+
+        self.wait_until = self.get_clock().now() + Duration(seconds=duration)
+        self.get_logger().info(
+            f'Шаг {self.current_step_index}: wait({duration} s) — ожидание начато'
+        )
 
     def _call_go_to_frame(self, frame: str):
         req = GoToFrame.Request()
@@ -307,6 +364,15 @@ class VoiceCommandExecutor(Node):
         self.get_logger().info(f'Шаг {self.current_step_index}: gripper({action})')
         self.current_future = self.gripper_client.call_async(req)
 
+    def _call_detect_object(self, class_name: str, duration: float):
+        req = DetectObject.Request()
+        req.class_name = class_name
+        req.duration = float(duration)
+        self.get_logger().info(
+            f'Шаг {self.current_step_index}: detect_object(class_name="{class_name}", duration={duration})'
+        )
+        self.current_future = self.detect_client.call_async(req)
+
     def _finish_current_scenario(self):
         self.get_logger().info(f'Сценарий "{self.current_command}" завершён')
         self._publish_status(f'done:{self.current_command}')
@@ -316,6 +382,7 @@ class VoiceCommandExecutor(Node):
         self.current_step_index = 0
         self.current_future = None
         self.cancel_requested = False
+        self.wait_until = None
 
         # Если есть сценарии в очереди — запускаем следующий
         if self.scenario_queue:
@@ -331,6 +398,7 @@ class VoiceCommandExecutor(Node):
         self.current_step_index = 0
         self.current_future = None
         self.cancel_requested = False
+        self.wait_until = None
 
     # ------------------------
     # Таймер-тикер
@@ -340,28 +408,75 @@ class VoiceCommandExecutor(Node):
         """
         Периодический "тик":
           - если есть активный сервисный вызов, ждём его завершения;
+          - если текущий шаг — 'wait', проверяем истечение времени;
           - после завершения шага запускаем следующий.
         """
-        if self.current_command is None:
+        if self.current_command is None or self.current_steps is None:
             return
 
-        # Если нет активного future — ничего не делаем
+        # Если запрошен стоп — прерываем
+        if self.cancel_requested:
+            self._abort_current_scenario(reason='cancel_requested')
+            return
+
+        if self.current_step_index >= len(self.current_steps):
+            return
+
+        step = self.current_steps[self.current_step_index]
+        step_type = step[0]
+
+        # Обработка шага ожидания
+        if step_type == 'wait':
+            if self.wait_until is None:
+                # На всякий случай: если не инициализировано, считаем, что ждать не надо
+                self.get_logger().warn(
+                    f'wait_without_wait_until на шаге {self.current_step_index}, пропускаю шаг'
+                )
+                self.current_step_index += 1
+                self._start_next_step()
+                return
+
+            now = self.get_clock().now()
+            if now >= self.wait_until:
+                self.get_logger().info(
+                    f'Шаг {self.current_step_index}: wait завершён'
+                )
+                self.wait_until = None
+                self.current_step_index += 1
+                self._start_next_step()
+            return
+
+        # Для остальных шагов ждём завершения текущего future
         if self.current_future is None:
             return
 
-        # Если future ещё не готов — ждём
         if not self.current_future.done():
             return
 
         # Обрабатываем результат вызова
         try:
-            _ = self.current_future.result()
+            result = self.current_future.result()
         except Exception as exc:
             self.get_logger().error(
                 f'Ошибка при выполнении шага сценария "{self.current_command}": {exc}'
             )
             self._abort_current_scenario(reason='service_error')
             return
+
+        # Специальная обработка для detect_object: проверяем accepted
+        if step_type == 'detect':
+            accepted = getattr(result, 'accepted', True)
+            message = getattr(result, 'message', '')
+            if not accepted:
+                self.get_logger().warn(
+                    f'detect_object не принял запрос для "{step[1]}": {message}'
+                )
+                self._abort_current_scenario(reason='detect_rejected')
+                return
+            else:
+                self.get_logger().info(
+                    f'detect_object ответил accepted=True для "{step[1]}": {message}'
+                )
 
         # Шаг успешно выполнен, переходим к следующему
         self.current_future = None
