@@ -12,6 +12,8 @@ from std_msgs.msg import String
 
 from tf2_ros import Buffer, TransformListener
 
+from std_srvs.srv import Trigger
+
 from ur_assist.srv import GripperAction, GoToFrame, DetectObject
 
 
@@ -22,12 +24,14 @@ class VoiceCommandExecutor(Node):
       - /gripper_action (ur_assist/srv/GripperAction)
       - /go_to_frame   (ur_assist/srv/GoToFrame)
       - /detect_object (ur_assist/srv/DetectObject)
+      - /setup_cups_frames (std_srvs/srv/Trigger)
 
     Шаги сценария:
       - ('go', frame_name)
       - ('gripper', True/False)
       - ('detect', class_name, duration)
       - ('wait', seconds)
+      - ('setup_cups',)
     """
 
     def __init__(self):
@@ -40,6 +44,7 @@ class VoiceCommandExecutor(Node):
                 ('base_frame', 'base_link'),
                 ('home_frame', 'home'),
                 ('podat_frame', 'pose_podat'),
+                ('watering_frame', 'pose_watering'),
 
                 ('hammer_pick_frame', 'hoba_target'),
                 ('hammer_place_frame', 'pose_up'),
@@ -51,7 +56,16 @@ class VoiceCommandExecutor(Node):
                 ('forward_frame', 'pose_forward'),
 
                 # Для сценария с детекцией отвертки
-                ('screwdriver_frame', 'screwdriver'),
+                ('screwdriver_frame', 'hoba_target'),
+
+                # Фреймы для сценария с двумя кружками (cups_frames_node)
+                ('cup1_pick_frame', 'cup1_pick'),
+                ('cup1_approach_frame', 'cup1_approach'),
+                ('cup2_pick_frame', 'cup2_pick'),
+                ('cup2_approach_frame', 'cup2_approach'),
+                ('pour1_frame', 'cup_pour_1'),
+                ('pour2_frame', 'cup_pour_2'),
+                ('pour3_frame', 'cup_pour_3'),
 
                 # Сколько секунд трекать объект в detect_object
                 ('detect_duration', 10.0),
@@ -64,6 +78,7 @@ class VoiceCommandExecutor(Node):
         self.base_frame = self.get_parameter('base_frame').value
         self.home_frame = self.get_parameter('home_frame').value
         self.podat_frame = self.get_parameter('podat_frame').value
+        self.watering_frame = self.get_parameter('watering_frame').value
 
         self.hammer_pick_frame = self.get_parameter('hammer_pick_frame').value
         self.hammer_place_frame = self.get_parameter('hammer_place_frame').value
@@ -75,6 +90,15 @@ class VoiceCommandExecutor(Node):
         self.forward_frame = self.get_parameter('forward_frame').value
 
         self.screwdriver_frame = self.get_parameter('screwdriver_frame').value
+
+        self.cup1_pick_frame = self.get_parameter('cup1_pick_frame').value
+        self.cup1_approach_frame = self.get_parameter('cup1_approach_frame').value
+        self.cup2_pick_frame = self.get_parameter('cup2_pick_frame').value
+        self.cup2_approach_frame = self.get_parameter('cup2_approach_frame').value
+        self.pour1_frame = self.get_parameter('pour1_frame').value
+        self.pour2_frame = self.get_parameter('pour2_frame').value
+        self.pour3_frame = self.get_parameter('pour3_frame').value
+
         self.detect_duration = float(self.get_parameter('detect_duration').value)
 
         self.queue_commands = bool(self.get_parameter('queue_commands').value)
@@ -84,13 +108,14 @@ class VoiceCommandExecutor(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Сценарии: список шагов (тип, аргументы)
-        # тип шага: "go", "gripper", "detect", "wait"
+        # тип шага: "go", "gripper", "detect", "wait", "setup_cups"
         self.scenarios = self._build_scenarios()
 
         # Клиенты к сервисам
         self.gripper_client = self.create_client(GripperAction, '/gripper_action')
         self.goto_client = self.create_client(GoToFrame, '/go_to_frame')
         self.detect_client = self.create_client(DetectObject, '/detect_object')
+        self.cups_setup_client = self.create_client(Trigger, '/setup_cups_frames')
 
         # Ждём сервисы на старте (блокирующе, но до spin это нормально)
         self.get_logger().info('Ожидание сервиса /gripper_action ...')
@@ -99,6 +124,8 @@ class VoiceCommandExecutor(Node):
         self.goto_client.wait_for_service()
         self.get_logger().info('Ожидание сервиса /detect_object ...')
         self.detect_client.wait_for_service()
+        self.get_logger().info('Ожидание сервиса /setup_cups_frames ...')
+        self.cups_setup_client.wait_for_service()
         self.get_logger().info('Сервисы доступны')
 
         # Подписчик на распознанные команды
@@ -135,8 +162,7 @@ class VoiceCommandExecutor(Node):
         """
         scenarios = {}
 
-        # Молоток: подняться, открыть хват, включить детекцию,
-        # подождать, поехать к найденному фрейму, схватить, подать.
+        # Молоток
         scenarios['молоток'] = [
             ('go', self.up_frame),
             ('gripper', True),                             # открыть
@@ -145,9 +171,10 @@ class VoiceCommandExecutor(Node):
             ('go', self.hammer_pick_frame),                # сюда должен публиковаться TF от детектора
             ('gripper', False),                            # закрыть
             ('go', self.up_frame),
+            ('go', self.podat_frame),
         ]
 
-        # Пример для отвертки (если нужно)
+        # Отвёртка
         scenarios['отвёртка'] = [
             ('go', self.up_frame),
             ('gripper', True),
@@ -156,6 +183,43 @@ class VoiceCommandExecutor(Node):
             ('go', self.screwdriver_frame),
             ('gripper', False),
             ('go', self.up_frame),
+            ('go', self.podat_frame),
+        ]
+
+        # Новое действие: "налей"
+        scenarios['воды'] = [
+            # 1) Настроить рабочие фреймы кружек по AprilTag (через cups_frames_node)
+            ('go', self.watering_frame),
+            ('setup_cups',),
+            ('wait', 0.5),  # небольшая пауза, чтобы TF успели появиться
+
+            # 2) Взять первую кружку
+            ('gripper', True),                   # открыть хват
+            ('go', self.cup1_approach_frame),    # подлёт к кружке 1
+            ('go', self.cup1_pick_frame),        # захват
+            ('gripper', False),                  # закрыть, взять кружку
+
+            # 3) Наливание во вторую кружку через три позы
+            ('go', self.pour1_frame),
+            ('wait', 1.0),
+            ('go', self.pour2_frame),
+            ('wait', 1.0),
+            ('go', self.pour3_frame),
+            ('wait', 1.0),
+            # возвращаемся из максимального наклона обратно
+            ('go', self.pour2_frame),
+            ('go', self.pour1_frame),
+
+            # 4) Положить первую кружку обратно
+            ('go', self.cup1_pick_frame),
+            ('gripper', True),                   # отпустить кружку
+            ('go', self.cup1_approach_frame),    # подлёт к кружке 1
+
+            # 5) Взять вторую кружку и поднести
+            ('go', self.cup2_approach_frame),
+            ('go', self.cup2_pick_frame),
+            ('gripper', False),                  # взять кружку 2
+            ('go', self.podat_frame),            # поднести
         ]
 
         # Простейшие команды
@@ -163,7 +227,6 @@ class VoiceCommandExecutor(Node):
             ('go', self.podat_frame),
         ]
 
-        # Простейшие команды
         scenarios['вперед'] = [
             ('go', self.forward_frame),
         ]
@@ -192,8 +255,6 @@ class VoiceCommandExecutor(Node):
         Если трансформа нет — пишет warning и возвращает False.
         """
         try:
-            # Time() с нулевым временем — "latest".
-            # Можно оставить timeout=0.0, раз ожидание выносим в шаг 'wait'.
             ok = self.tf_buffer.can_transform(
                 self.base_frame,
                 frame,
@@ -329,6 +390,9 @@ class VoiceCommandExecutor(Node):
             duration = float(step[1]) if len(step) > 1 else 0.0
             self._start_wait(duration)
 
+        elif step_type == 'setup_cups':
+            self._call_setup_cups()
+
         else:
             self.get_logger().error(f'Неизвестный тип шага: {step_type}')
             self._abort_current_scenario(reason=f'unknown_step_type:{step_type}')
@@ -372,6 +436,13 @@ class VoiceCommandExecutor(Node):
             f'Шаг {self.current_step_index}: detect_object(class_name="{class_name}", duration={duration})'
         )
         self.current_future = self.detect_client.call_async(req)
+
+    def _call_setup_cups(self):
+        req = Trigger.Request()
+        self.get_logger().info(
+            f'Шаг {self.current_step_index}: setup_cups_frames()'
+        )
+        self.current_future = self.cups_setup_client.call_async(req)
 
     def _finish_current_scenario(self):
         self.get_logger().info(f'Сценарий "{self.current_command}" завершён')
@@ -476,6 +547,21 @@ class VoiceCommandExecutor(Node):
             else:
                 self.get_logger().info(
                     f'detect_object ответил accepted=True для "{step[1]}": {message}'
+                )
+
+        # Специальная обработка для setup_cups_frames: проверяем success
+        if step_type == 'setup_cups':
+            success = getattr(result, 'success', True)
+            message = getattr(result, 'message', '')
+            if not success:
+                self.get_logger().warn(
+                    f'setup_cups_frames неуспешен: {message}'
+                )
+                self._abort_current_scenario(reason='setup_cups_failed')
+                return
+            else:
+                self.get_logger().info(
+                    f'setup_cups_frames успешно: {message}'
                 )
 
         # Шаг успешно выполнен, переходим к следующему
