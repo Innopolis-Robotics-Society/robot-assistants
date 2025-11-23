@@ -22,6 +22,7 @@ set(srv_files
   "srv/MoveToPose.srv"
   "srv/GoToFrame.srv"
   "srv/GripperAction.srv"
+  "srv/DetectObject.srv"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
