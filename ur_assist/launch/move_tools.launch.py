@@ -52,9 +52,41 @@ def generate_launch_description():
         ],
     )
 
+    rlr_bringup = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("rlr_bringup"),
+                        "launch",
+                        "bringup.launch.py",
+                    ]
+                )
+            ]
+        ),
+        launch_arguments=[
+        ]
+    )
+
+    voice_rec = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("voice_controlled_robot"),
+                        "launch",
+                        "voice_control.launch.py",
+                    ]
+                )
+            ]
+        ),
+    )
+
     return LaunchDescription([
         ins_search,
         go_to_frame,
         exec_ik_move,
-        gripper_control
+        gripper_control,
+        rlr_bringup,
+        voice_rec
     ])
