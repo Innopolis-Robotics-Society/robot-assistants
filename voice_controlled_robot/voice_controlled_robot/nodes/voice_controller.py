@@ -1,125 +1,133 @@
 #!/usr/bin/env python3
 
-import rclpy
-from rclpy.node import Node
 import json
 import queue
-import sys
-import re
 import os
+import re
+import sys
+
+import rclpy
+from rclpy.node import Node
+
+from std_msgs.msg import String
 from vosk import Model, KaldiRecognizer
 import sounddevice as sd
 
-from std_msgs.msg import String
-from geometry_msgs.msg import Twist
 from voice_controlled_robot.utils.audio_utils import AudioUtils
 
+
 class VoiceController(Node):
-    """Основной нод для голосового управления роботом."""
+    """Нода: слушает микрофон, распознаёт речь, выделяет команду после ключевого слова и
+    публикует только команды из разрешённого списка.
+    """
 
     def __init__(self):
         super().__init__('voice_controller')
-        
+
         # Параметры
         self.declare_parameters(
             namespace='',
             parameters=[
                 ('model_path', ''),
-                ('similarity_threshold', 0.7),
                 ('audio_device', 'auto'),
                 ('sample_rate', 16000),
-                ('publish_tool_commands', True),
-                ('enable_partial_results', True)
+                ('enable_partial_results', True),
+                # Ключевое слово (обращение к роботу), напр. "робот"
+                ('wake_word', 'робот'),
             ]
         )
-        
-        # Получение параметров
+
         model_path_param = self.get_parameter('model_path').value
-        self.similarity_threshold = self.get_parameter('similarity_threshold').value
         self.audio_device_param = self.get_parameter('audio_device').value
-        self.sample_rate = self.get_parameter('sample_rate').value
-        self.publish_tool_commands = self.get_parameter('publish_tool_commands').value
-        self.enable_partial_results = self.get_parameter('enable_partial_results').value
-        
-        # Определение пути к модели
-        if model_path_param:
-            self.model_path = model_path_param
-        else:
-            # Попробуем найти модель в стандартных местах
-            possible_paths = [
-                os.path.expanduser('~/vosk-models/vosk-model-small-ru-0.22'),
-                '/usr/share/vosk-models/vosk-model-small-ru-0.22',
-                os.path.join(os.path.dirname(__file__), '../../../../share/vosk-models/vosk-model-small-ru-0.22')
-            ]
-            
-            for path in possible_paths:
-                if os.path.exists(path):
-                    self.model_path = path
-                    break
-            else:
-                self.get_logger().error('❌ Модель Vosk не найдена. Установите модель:')
-                self.get_logger().error('wget https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip')
-                self.get_logger().error('unzip vosk-model-small-ru-0.22.zip')
-                self.get_logger().error('И укажите путь в параметре model_path')
-                raise FileNotFoundError('Модель Vosk не найдена')
-        
-        self.get_logger().info(f'📁 Используется модель: {self.model_path}')
-        
-        # Словарь инструментов
-        self.tools_dict = {
-            'молоток': ['молоток', 'молот', 'кувалда'],
-            'отвертка': ['отвертка', 'отверточка'],
-            'гаечный ключ': ['гаечный ключ', 'ключ'],
-            'плоскогубцы': ['плоскогубцы', 'пассатижи'],
-            'ножовка': ['ножовка', 'пила'],
-            'рулетка': ['рулетка', 'метр'],
-            'дрель': ['дрель', 'шуруповерт'],
-            'стамеска': ['стамеска'],
-            'уровень': ['уровень'],
-            'нож': ['нож', 'резак']
-        }
-        
-        # Команды управления
-        self.control_commands = {
-            'вперед': ['вперед', 'прямо', 'вперёд'],
-            'назад': ['назад', 'обратно'],
-            'влево': ['влево', 'налево'],
-            'вправо': ['вправо', 'направо'],
+        self.sample_rate = int(self.get_parameter('sample_rate').value)
+        self.enable_partial_results = bool(self.get_parameter('enable_partial_results').value)
+        self.wake_word = self.get_parameter('wake_word').value.strip().lower()
+
+        # Разрешённые команды и их варианты в тексте
+        # Публикуется КАНОНИЧЕСКИЙ ключ: "вперед", "назад" и т.п.
+        self.allowed_commands = {
+            'молоток': ['молот', 'кувалда', 'молоток'],
+            'отвёртка': ['отвёртка', 'отвертка', 'крутилка', 'вертелка', 'отвертку', 'отвёртку'],
+            'воды': ['воды', 'попить', 'водички', 'воду'],
+
+            'вверх': ['над', 'вверх', 'сверху', 'наверх', 'верх'],
+            'вперед': ['спереди', 'передний', 'вперед', 'вперёд'],
+
+            'воды': ['вода', 'воды', 'водичка', 'попить'],
+            'открой': ['брось', 'фу', 'отпусти', 'открой', 'отдай'],
+            'закрой': ['закрой', 'возьми', 'держи', 'фас'],
+            'поднеси': ['поднеси', 'верни', 'подай'],
+
             'стоп': ['стоп', 'остановись', 'стой'],
         }
-        
+
+        # Определение пути к модели
+        self.model_path = self._resolve_model_path(model_path_param)
+        self.get_logger().info(f'Используется модель: {self.model_path}')
+
         # Публикаторы
-        self.tool_command_pub = self.create_publisher(String, 'voice/tool_command', 10)
-        self.control_command_pub = self.create_publisher(String, 'voice/control_command', 10)
-        self.velocity_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        # Полный распознанный текст
         self.recognized_speech_pub = self.create_publisher(String, 'voice/recognized_speech', 10)
-        
+        # Только команда (из разрешённого списка), выделенная после wake_word
+        self.command_pub = self.create_publisher(String, 'voice/command', 10)
+        # Отладочная информация
+        self.debug_pub = self.create_publisher(String, 'voice/debug', 10)
+
         # Очередь для аудиоданных
         self.audio_queue = queue.Queue()
-        
-        # Инициализация аудио
-        self.initialize_audio()
-        
-        # Таймер для обработки аудио
-        self.create_timer(0.1, self.process_audio)
-        
-        self.get_logger().info('🎤 Голосовой контроллер запущен')
 
-    def initialize_audio(self):
-        """Инициализация аудиосистемы."""
+        self.audio_stream = None
+        self.model = None
+        self.recognizer = None
+
+        # Инициализация модели и аудио
+        self.initialize_recognizer_and_audio()
+
+        # Таймер обработки аудио
+        self.create_timer(0.1, self.process_audio)
+
+        self.get_logger().info('Нода голосового управления запущена')
+
+    def _resolve_model_path(self, model_path_param: str) -> str:
+        """Определение пути к модели Vosk."""
+        if model_path_param:
+            if not os.path.exists(model_path_param):
+                self.get_logger().error(f'Указанный model_path не существует: {model_path_param}')
+                raise FileNotFoundError(model_path_param)
+            return model_path_param
+
+        possible_paths = [
+            os.path.expanduser('~/vosk-models/vosk-model-small-ru-0.22'),
+            '/usr/share/vosk-models/vosk-model-small-ru-0.22',
+            os.path.join(
+                os.path.dirname(__file__),
+                '../../../../share/voice_controlled_robot/models/vosk-model-small-ru-0.22'
+            ),
+        ]
+
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+
+        self.get_logger().error('Модель Vosk не найдена. Укажите параметр model_path или установите модель в одно из стандартных мест.')
+        raise FileNotFoundError('Модель Vosk не найдена')
+
+    def initialize_recognizer_and_audio(self):
+        """Инициализация модели Vosk и аудиопотока."""
         try:
-            # Выбор аудиоустройства
+            self.get_logger().info(f'Загрузка модели Vosk из: {self.model_path}')
+            self.model = Model(self.model_path)
+            self.recognizer = KaldiRecognizer(self.model, self.sample_rate)
+        except Exception as e:
+            self.get_logger().error(f'Ошибка загрузки модели Vosk: {e}')
+            raise
+
+        try:
             if self.audio_device_param == 'auto':
                 self.audio_device = AudioUtils.pick_input_device()
             else:
                 self.audio_device = int(self.audio_device_param)
-            
-            # Загрузка модели распознавания речи
-            self.get_logger().info(f'📥 Загрузка модели Vosk из: {self.model_path}')
-            self.model = Model(self.model_path)
-            self.recognizer = KaldiRecognizer(self.model, self.sample_rate)
-            
-            # Запуск аудиопотока
+
             self.audio_stream = sd.RawInputStream(
                 callback=self.audio_callback,
                 channels=1,
@@ -128,142 +136,156 @@ class VoiceController(Node):
                 dtype='int16'
             )
             self.audio_stream.start()
-            
-            self.get_logger().info(f'✅ Аудио инициализировано (устройство: {self.audio_device})')
-            
+
+            self.get_logger().info(f'Аудио инициализировано, устройство: {self.audio_device}')
         except Exception as e:
-            self.get_logger().error(f'❌ Ошибка инициализации аудио: {e}')
+            self.get_logger().error(f'Ошибка инициализации аудио: {e}')
             raise
 
     def audio_callback(self, indata, frames, time, status):
-        """Callback-функция для обработки аудиопотока."""
+        """Callback для sounddevice: складывает сырые данные в очередь."""
         if status:
-            self.get_logger().warn(f'Аудио статус: {status}')
+            msg = f'Аудио статус: {status}'
+            self.get_logger().warn(msg)
+            dbg = String()
+            dbg.data = msg
+            self.debug_pub.publish(dbg)
+
         self.audio_queue.put(bytes(indata))
 
-    def find_tools_in_command(self, command):
-        """Поиск инструментов в команде."""
-        command = command.lower().strip()
-        found_tools = []
-        
-        # Быстрый поиск по подстроке
-        for tool, keywords in self.tools_dict.items():
-            for keyword in keywords:
-                if keyword in command:
-                    found_tools.append(tool)
-                    break
-        
-        if found_tools:
-            return list(set(found_tools))
-        
-        # Поиск по схожести для случаев с ошибками
-        words = re.findall(r'\w+', command)
-        for word in words:
-            for tool, keywords in self.tools_dict.items():
-                for keyword in keywords:
-                    if AudioUtils.similarity(word, keyword) >= self.similarity_threshold:
-                        found_tools.append(tool)
-                        break
-        
-        return list(set(found_tools))
+    def extract_text_after_wake_word(self, text: str):
+        """
+        Возвращает текст после ключевого слова (wake_word).
 
-    def find_control_commands(self, command):
-        """Поиск команд управления в тексте."""
-        command = command.lower().strip()
-        
-        for control_cmd, keywords in self.control_commands.items():
-            for keyword in keywords:
-                if keyword in command:
-                    return control_cmd
+        Если wake_word пустой — возвращает исходный текст.
+        Если ключевое слово не найдено — возвращает None.
+        """
+        raw_text = text.strip()
+        if not raw_text:
+            return None
+
+        if not self.wake_word:
+            return raw_text
+
+        lower_text = raw_text.lower()
+        idx = lower_text.find(self.wake_word)
+        if idx == -1:
+            return None
+
+        start_idx = idx + len(self.wake_word)
+        command_part = raw_text[start_idx:].strip()
+
+        # Убираем начальные разделители/пробелы
+        command_part = re.sub(r'^[,.:;«»"\s]+', '', command_part).strip()
+
+        return command_part or None
+
+    def detect_allowed_command(self, text_after_wake: str):
+        """
+        Находит разрешённую команду в тексте после wake_word.
+
+        Возвращает каноническое имя команды (ключ словаря self.allowed_commands) или None.
+        """
+        if not text_after_wake:
+            return None
+
+        lower_cmd = text_after_wake.lower()
+
+        for canonical, variants in self.allowed_commands.items():
+            for phrase in variants:
+                # Ищем фразу как отдельное слово или часть, окружённую границами слова
+                pattern = r'\b' + re.escape(phrase) + r'\b'
+                if re.search(pattern, lower_cmd):
+                    return canonical
+
         return None
 
-    def execute_control_command(self, command):
-        """Выполнение команды управления."""
-        twist_msg = Twist()
-        
-        if command == 'вперед':
-            twist_msg.linear.x = 0.2
-        elif command == 'назад':
-            twist_msg.linear.x = -0.2
-        elif command == 'влево':
-            twist_msg.angular.z = 0.5
-        elif command == 'вправо':
-            twist_msg.angular.z = -0.5
-        elif command == 'стоп':
-            twist_msg.linear.x = 0.0
-            twist_msg.angular.z = 0.0
-        
-        self.velocity_pub.publish(twist_msg)
-        self.get_logger().info(f'🚗 Выполняю команду: {command}')
-
     def process_audio(self):
-        """Обработка аудиоданных."""
+        """Обработка аудиоданных и распознавание речи."""
+        if self.recognizer is None:
+            return
+
         try:
             while not self.audio_queue.empty():
                 data = self.audio_queue.get()
-                
+
                 if self.recognizer.AcceptWaveform(data):
                     result = json.loads(self.recognizer.Result())
                     text = result.get("text", "").strip()
-                    
-                    if text:
-                        self.get_logger().info(f'🗣️ Распознано: "{text}"')
-                        
-                        # Публикация распознанной речи
-                        speech_msg = String()
-                        speech_msg.data = text
-                        self.recognized_speech_pub.publish(speech_msg)
-                        
-                        # Поиск инструментов
-                        tools = self.find_tools_in_command(text)
-                        if tools and self.publish_tool_commands:
-                            tool_msg = String()
-                            tool_msg.data = json.dumps({
-                                'tools': tools,
-                                'original_command': text
-                            })
-                            self.tool_command_pub.publish(tool_msg)
-                            self.get_logger().info(f'🎯 Инструменты: {", ".join(tools)}')
-                        
-                        # Поиск команд управления
-                        control_cmd = self.find_control_commands(text)
-                        if control_cmd:
-                            control_msg = String()
-                            control_msg.data = control_cmd
-                            self.control_command_pub.publish(control_msg)
-                            self.execute_control_command(control_cmd)
-                
+                    if not text:
+                        continue
+
+                    # Публикуем полный распознанный текст
+                    speech_msg = String()
+                    speech_msg.data = text
+                    self.recognized_speech_pub.publish(speech_msg)
+                    self.get_logger().info(f'Распознано: "{text}"')
+
+                    # Текст после ключевого слова
+                    tail = self.extract_text_after_wake_word(text)
+                    if tail is None:
+                        dbg_msg = String()
+                        dbg_msg.data = f'wake_word="{self.wake_word}" не найден, текст="{text}"'
+                        self.debug_pub.publish(dbg_msg)
+                        continue
+
+                    # Поиск разрешённой команды
+                    command = self.detect_allowed_command(tail)
+                    if command is not None:
+                        cmd_msg = String()
+                        cmd_msg.data = command
+                        self.command_pub.publish(cmd_msg)
+
+                        dbg_msg = String()
+                        dbg_msg.data = f'Команда распознана: canonical="{command}", tail="{tail}"'
+                        self.debug_pub.publish(dbg_msg)
+                        self.get_logger().info(f'Команда: "{command}"')
+                    else:
+                        dbg_msg = String()
+                        dbg_msg.data = f'Команда не распознана в tail="{tail}"'
+                        self.debug_pub.publish(dbg_msg)
+
                 elif self.enable_partial_results:
-                    # Вывод частичных результатов
                     partial_result = json.loads(self.recognizer.PartialResult())
                     partial_text = partial_result.get("partial", "").strip()
                     if partial_text:
-                        self.get_logger().info(f'▌ Слушаю: {partial_text}', skip_first=True)
-                        
+                        dbg_msg = String()
+                        dbg_msg.data = f'partial="{partial_text}"'
+                        self.debug_pub.publish(dbg_msg)
+
         except Exception as e:
-            self.get_logger().error(f'❌ Ошибка обработки аудио: {e}')
+            self.get_logger().error(f'Ошибка обработки аудио: {e}')
+            dbg_msg = String()
+            dbg_msg.data = f'Ошибка обработки аудио: {e}'
+            self.debug_pub.publish(dbg_msg)
 
     def destroy_node(self):
-        """Очистка ресурсов при завершении."""
-        if hasattr(self, 'audio_stream'):
-            self.audio_stream.stop()
-            self.audio_stream.close()
+        """Освобождение ресурсов."""
+        if self.audio_stream is not None:
+            try:
+                self.audio_stream.stop()
+                self.audio_stream.close()
+            except Exception:
+                pass
         super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
-    
+
+    voice_controller = None
     try:
         voice_controller = VoiceController()
         rclpy.spin(voice_controller)
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        print(f'Ошибка: {e}', file=sys.stderr)
     finally:
-        if 'voice_controller' in locals():
+        if voice_controller is not None:
             voice_controller.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
