@@ -3,6 +3,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/pose.hpp"
@@ -199,8 +200,68 @@ int main(int argc, char** argv)
         return;
       }
 
+      // 6. Проверка: реально ли TCP дошёл до целевой позы
+      geometry_msgs::msg::TransformStamped tf_base_tcp_final_msg;
+      try
+      {
+        tf_base_tcp_final_msg = getTransform(base_frame, tcp_frame);
+      }
+      catch (const std::exception& ex)
+      {
+        RCLCPP_ERROR(logger,
+                     "TF lookup failed for final TCP pose: %s", ex.what());
+        response->success = false;
+        response->message = std::string("TF lookup failed after motion: ") + ex.what();
+        return;
+      }
+
+      tf2::Transform T_base_tcp_final;
+      tf2::fromMsg(tf_base_tcp_final_msg.transform, T_base_tcp_final);
+
+      // Ошибка по позиции
+      tf2::Vector3 p_final  = T_base_tcp_final.getOrigin();
+      tf2::Vector3 p_target = T_base_tcp_target.getOrigin();
+      double pos_error = (p_final - p_target).length();  // [м]
+
+      // Ошибка по ориентации
+      tf2::Quaternion q_final  = T_base_tcp_final.getRotation();
+      tf2::Quaternion q_target = T_base_tcp_target.getRotation();
+      q_final.normalize();
+      q_target.normalize();
+
+      double dot = q_final.x() * q_target.x() +
+                   q_final.y() * q_target.y() +
+                   q_final.z() * q_target.z() +
+                   q_final.w() * q_target.w();
+      dot = std::max(-1.0, std::min(1.0, static_cast<double>(dot)));
+      double ang_error_rad = 2.0 * std::acos(std::fabs(dot));
+      double ang_error_deg = ang_error_rad * 180.0 / M_PI;
+
       RCLCPP_INFO(logger,
-                  "Successfully executed Cartesian path for TCP '%s'",
+                  "Final TCP error: position = %.3f mm, orientation = %.2f deg",
+                  pos_error * 1000.0, ang_error_deg);
+
+      // Пороги (можно вынести в параметры)
+      const double pos_tolerance = 0.005;   // 5 мм
+      const double ang_tolerance = 5.0;     // 5 градусов
+
+      if (pos_error > pos_tolerance || ang_error_deg > ang_tolerance)
+      {
+        RCLCPP_WARN(logger,
+                    "Target reached with too large error "
+                    "(pos: %.3f m, ang: %.2f deg). Marking as failure.",
+                    pos_error, ang_error_deg);
+        response->success = false;
+        response->message =
+          "Final TCP pose outside tolerance: pos=" +
+          std::to_string(pos_error) +
+          " m, ang=" + std::to_string(ang_error_deg) + " deg";
+        return;
+      }
+
+      RCLCPP_INFO(logger,
+                  "Successfully executed Cartesian path for TCP '%s' "
+                  "(final error within tolerance)",
                   tcp_frame.c_str());
 
       response->success = true;

@@ -6,7 +6,11 @@ from collections import deque
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
+from rclpy.duration import Duration
 from std_msgs.msg import String
+
+from tf2_ros import Buffer, TransformListener
 
 from ur_assist.srv import GripperAction, GoToFrame
 
@@ -32,22 +36,28 @@ class VoiceCommandExecutor(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
+                ('base_frame', 'base_link'),
                 ('home_frame', 'home'),
+                ('podat_frame', 'pose_podat'),
 
-                ('hammer_pick_frame', 'marker_hammer_pick'),
-                ('hammer_place_frame', 'marker_hammer_place'),
+                ('hammer_pick_frame', 'hoba_target'),
+                ('hammer_place_frame', 'pose_up'),
 
                 ('water_pick_frame', 'marker_water_pick'),
                 ('water_place_frame', 'marker_water_place'),
 
                 ('up_frame', 'pose_up'),
+                ('forward_frame', 'pose_forward'),
 
                 # Если False — игнорировать новые команды, пока идёт сценарий
-                ('queue_commands', True),
+                ('queue_commands', False),
             ]
         )
 
+        self.base_frame = self.get_parameter('base_frame').value
         self.home_frame = self.get_parameter('home_frame').value
+        self.podat_frame = self.get_parameter('podat_frame').value
+
 
         self.hammer_pick_frame = self.get_parameter('hammer_pick_frame').value
         self.hammer_place_frame = self.get_parameter('hammer_place_frame').value
@@ -56,8 +66,13 @@ class VoiceCommandExecutor(Node):
         self.water_place_frame = self.get_parameter('water_place_frame').value
 
         self.up_frame = self.get_parameter('up_frame').value
+        self.forward_frame = self.get_parameter('forward_frame').value
 
         self.queue_commands = bool(self.get_parameter('queue_commands').value)
+
+        # TF
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Сценарии: список шагов (тип, аргументы)
         # тип: "go" или "gripper"
@@ -105,14 +120,14 @@ class VoiceCommandExecutor(Node):
         """
         scenarios = {}
 
-
-        # scenarios['молоток'] = [
-        #     ('go', self.hammer_pick_frame),
-        #     ('gripper', False),  # закрыть
-        #     ('go', self.hammer_place_frame),
-        #     ('gripper', True),   # открыть
-        #     ('go', self.home_frame),
-        # ]
+        scenarios['молоток'] = [
+            ('go', self.up_frame),
+            ('gripper', True),   # открыть
+            ('go', self.hammer_pick_frame),
+            ('gripper', False),  # закрыть
+            ('go', self.hammer_place_frame),
+            ('go', self.podat_frame),
+        ]
 
         # # Сценарий "воды"
         # scenarios['воды'] = [
@@ -123,11 +138,55 @@ class VoiceCommandExecutor(Node):
         #     ('go', self.home_frame),
         # ]
 
+        scenarios['вперед'] = [
+            ('go', self.forward_frame),
+        ]
+
+        scenarios['открой'] = [
+            ('gripper', True),
+        ]
+
+        scenarios['закрой'] = [
+            ('gripper', False),
+        ]
+
         scenarios['вверх'] = [
             ('go', self.up_frame),
         ]
 
         return scenarios
+
+    # ------------------------
+    # Проверка наличия TF
+    # ------------------------
+
+    def _check_frame_exists(self, frame: str) -> bool:
+        """
+        Проверяет, существует ли TF от base_frame до frame.
+        Если трансформа нет — пишет warning и возвращает False.
+        """
+        try:
+            # Time() с нулевым временем — "latest"
+            ok = self.tf_buffer.can_transform(
+                self.base_frame,
+                frame,
+                Time(),
+                timeout=Duration(seconds=0.0)
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f'Ошибка при проверке TF для "{frame}" относительно "{self.base_frame}": {e}'
+            )
+            return False
+
+        if not ok:
+            self.get_logger().warn(
+                f'TF для фрейма "{frame}" относительно "{self.base_frame}" не найден. '
+                f'Сценарий "{self.current_command}" будет прерван.'
+            )
+            return False
+
+        return True
 
     # ------------------------
     # Подписчик на voice/command
@@ -220,7 +279,14 @@ class VoiceCommandExecutor(Node):
 
         if step_type == 'go':
             frame = step[1]
+
+            # Проверяем, что TF до этого фрейма существует
+            if not self._check_frame_exists(frame):
+                self._abort_current_scenario(reason=f'no_tf:{frame}')
+                return
+
             self._call_go_to_frame(frame)
+
         elif step_type == 'gripper':
             open_flag = bool(step[1])
             self._call_gripper(open_flag)
@@ -291,7 +357,9 @@ class VoiceCommandExecutor(Node):
         try:
             _ = self.current_future.result()
         except Exception as exc:
-            self.get_logger().error(f'Ошибка при выполнении шага сценария "{self.current_command}": {exc}')
+            self.get_logger().error(
+                f'Ошибка при выполнении шага сценария "{self.current_command}": {exc}'
+            )
             self._abort_current_scenario(reason='service_error')
             return
 
