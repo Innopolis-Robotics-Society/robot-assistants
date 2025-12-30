@@ -22,7 +22,8 @@ cameras:
       image_size: [640, 480]
 
   mook_laptop_camera:
-    video_device: "/dev/v4l/by-id/usb-Shinetech_USB2.0_FHD_UVC_WebCam_200901010001-video-index0"
+    video_device: /dev/video0
+    # video_device: "/dev/v4l/by-id/usb-Shinetech_USB2.0_FHD_UVC_WebCam_200901010001-video-index0"
     camera_info: "calibration/mook_laptop_camera.yaml"
     frame_id: "mook_laptop_camera_optical_frame"
     tf:
