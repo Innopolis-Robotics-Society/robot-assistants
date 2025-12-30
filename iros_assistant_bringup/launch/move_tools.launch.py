@@ -69,7 +69,7 @@ def generate_launch_description():
                     [
                         FindPackageShare("iros_assistant_bringup"),
                         "launch",
-                        "bringup.launch.py",
+                        "bringup_rlr.launch.py",
                     ]
                 )
             ]

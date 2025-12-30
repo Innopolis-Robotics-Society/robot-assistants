@@ -23,7 +23,7 @@ def generate_launch_description():
             ]
         ),
         launch_arguments=[
-    ('image_source', '/dev/video0'),
+    ('cameras', 'mook_laptop_camera'),
 ]
     )
 
@@ -40,6 +40,7 @@ def generate_launch_description():
             ]
         ),
         launch_arguments=[
+        ('camera', 'mook_laptop_camera'),
         ],
     )
 
