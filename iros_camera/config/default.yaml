@@ -1,0 +1,5 @@
+v4l2_camera:
+  ros__parameters:
+    pixel_format: "YUYV"
+    output_encoding: "rgb8"
+    image_size: [640, 480]
