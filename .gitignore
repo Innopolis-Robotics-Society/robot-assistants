@@ -1,0 +1,80 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+.ipynb_checkpoints/
+
+# корневые артефакты рабочей области
+build/
+install/
+log/
+
+# артефакты внутри подпакетов
+**/build/
+**/install/
+**/log/
+
+# rosbag2
+*.db3
+*.db3-wal
+*.db3-shm
+*.bag
+*.bag.active
+*.bag.orig
+*.mcap
+
+# CMake / C++
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+*.exe
+
+# Docker / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Logs / runtime outputs
+*.log
+logs/
+**/logs/
+**/ur_log/
+**/UrDataLog.csv
+**/UrEvent.log

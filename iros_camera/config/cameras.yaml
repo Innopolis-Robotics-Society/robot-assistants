@@ -1,0 +1,33 @@
+cameras:
+  marat_camera:
+    video_device: "/dev/v4l/by-id/usb-XXXXXX-video-index0"
+    camera_info: "calibration/marat_camera.yaml"
+    frame_id: "marat_camera_optical_frame"
+    tf:
+      parent_frame: "tool0_controller"
+      xyz: [0.046, 0.0, 0.0]
+      rpy: [1.5708, 3.1416, 0.0]   # roll, pitch, yaw (рад)
+    params:
+      image_size: [1280, 720]
+
+  enya_camera:
+    video_device: "/dev/v4l/by-id/usb-YYYYYY-video-index0"
+    camera_info: "calibration/senya_camera.yaml"
+    frame_id: "senya_camera_optical_frame"
+    tf:
+      parent_frame: "base_link"
+      xyz: [0.10, 0.05, 0.20]
+      rpy: [0.0, 0.0, 0.0]
+    params:
+      image_size: [640, 480]
+
+  mook_laptop_camera:
+    video_device: "/dev/v4l/by-id/usb-Shinetech_USB2.0_FHD_UVC_WebCam_200901010001-video-index0"
+    camera_info: "calibration/mook_laptop_camera.yaml"
+    frame_id: "mook_laptop_camera_optical_frame"
+    tf:
+      parent_frame: "base_link"
+      xyz: [0.10, 0.05, 0.20]
+      rpy: [0.0, 0.0, 0.0]
+    params:
+      image_size: [640, 480]
