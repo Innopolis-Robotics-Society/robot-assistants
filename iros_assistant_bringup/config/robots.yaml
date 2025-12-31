@@ -1,0 +1,26 @@
+robots:
+  ur1:
+    type: ur
+    namespace: ur10e-1
+    robot_ip: 192.168.0.100
+    ur_model: ur10e
+    kinematics_yaml: config/UR10e-1.yaml
+    with_moveit: true
+    enabled: true
+
+  ur2:
+    type: ur
+    namespace: ur10e-2
+    robot_ip: none
+    ur_model: ur10e
+    kinematics_yaml: none
+    with_moveit: true
+    enabled: false
+
+  # пример будущего другого робота
+  # robot2:
+  #   type: my_robot
+  #   namespace: robot2
+  #   enabled: true
+  #   args:
+  #     some_param: some_value

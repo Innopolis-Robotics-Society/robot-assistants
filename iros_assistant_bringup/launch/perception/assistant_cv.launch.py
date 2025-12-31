@@ -23,8 +23,8 @@ def generate_launch_description():
             ]
         ),
         launch_arguments=[
-    ('cameras', 'mook_laptop_camera'),
-]
+            ('cameras', 'mook_laptop_camera'),
+        ]
     )
 
     april_tags_launch = IncludeLaunchDescription(
@@ -40,7 +40,19 @@ def generate_launch_description():
             ]
         ),
         launch_arguments=[
-        ('camera', 'mook_laptop_camera'),
+            ('camera', 'mook_laptop_camera'),
+        ],
+    )
+
+    ins_search = Node(
+        package="iros_cv",
+        executable="ins_search",
+        output="screen",
+        parameters=[
+            {
+                'model_path': '/home/mobile/ros2_ws/src/iros_cv/models/best_fixed.pt',
+                "image_topic": "/image_rect",
+            },
         ],
     )
 
@@ -53,5 +65,6 @@ def generate_launch_description():
     return LaunchDescription([
         camera_launch,
         april_tags_launch,
-        rviz
+        ins_search,
+        rviz,
     ])
