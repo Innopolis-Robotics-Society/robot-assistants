@@ -17,21 +17,15 @@ def generate_launch_description():
         'ur_model',
         default_value='ur10e')
 
-
     robot_ip = LaunchConfiguration('robot_ip')
     ur_model = LaunchConfiguration('ur_model')
-    rviz_config_file = PathJoinSubstitution(
-        [FindPackageShare("ur_moveit_config"), "config", "moveit.rviz"]
-    )
 
     ur_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
                 PathJoinSubstitution(
                     [
-                        FindPackageShare("ur_robot_driver"),
-                        "launch",
-                        "ur_control.launch.py",
+                        FindPackageShare("iros_assistant_bringup"), "launch", "robots", "ur.launch.py",
                     ]
                 )
             ]
@@ -46,32 +40,56 @@ def generate_launch_description():
         ]
     )
 
-    moveit_launch = IncludeLaunchDescription(
+    move_tools = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
                 PathJoinSubstitution(
                     [
-                        FindPackageShare("ur_moveit_config"),
-                        "launch",
-                        "ur_moveit.launch.py",
+                        FindPackageShare("iros_assistant_bringup"), "launch", "tools", "move_tools.launch.py",
                     ]
                 )
             ]
         ),
-        launch_arguments=[
-            ('ur_type', ur_model),
-            ('launch_rviz','true'),
-        ]
+        launch_arguments=[]
     )
+
+    voice = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("iros_assistant_bringup"), "launch", "tools", "voice.launch.py",
+                    ]
+                )
+            ]
+        ),
+        launch_arguments=[]
+    )
+
+    assistant_cv = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("iros_assistant_bringup"), "launch", "perception", "assistant_cv.launch.py",
+                    ]
+                )
+            ]
+        ),
+        launch_arguments=[]
+    )
+
+    voice_beh = Node(
+            package='iros_assistant_behavior',
+            executable='voice_beh',
+        )
 
     tf = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
                 PathJoinSubstitution(
                     [
-                        FindPackageShare("iros_assistant_bringup"),
-                        "launch",
-                        "tf.launch.py",
+                        FindPackageShare("iros_assistant_bringup"), "launch", "world", "poses.launch.py",
                     ]
                 )
             ]
@@ -80,10 +98,15 @@ def generate_launch_description():
         ]
     )
 
+
+
     return LaunchDescription([
         ur_model_arg,
         robot_ip_arg,
         tf,
         ur_launch,
-        moveit_launch,
+        move_tools,
+        voice,
+        assistant_cv,
+        voice_beh,
     ])

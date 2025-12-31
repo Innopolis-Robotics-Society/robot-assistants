@@ -9,19 +9,6 @@ from pathlib import Path
 import os
 def generate_launch_description():
 
-
-    ins_search = Node(
-        package="iros_cv",
-        executable="ins_search",
-        output="screen",
-        parameters=[
-            {
-                'model_path': '/home/mobile/ros2_ws/src/iros_cv/models/best_fixed.pt',
-                "image_topic": "/image_rect",
-            },
-        ],
-    )
-
     go_to_frame = Node(
         package="iros_assistant_bringup",
         executable="go_to_frame",
@@ -62,42 +49,10 @@ def generate_launch_description():
         ],
     )
 
-    rlr_bringup = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            [
-                PathJoinSubstitution(
-                    [
-                        FindPackageShare("iros_assistant_bringup"),
-                        "launch",
-                        "bringup_rlr.launch.py",
-                    ]
-                )
-            ]
-        ),
-        launch_arguments=[
-        ]
-    )
-
-    voice_rec = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            [
-                PathJoinSubstitution(
-                    [
-                        FindPackageShare("iros_ru_voice_recognision"),
-                        "launch",
-                        "voice_control.launch.py",
-                    ]
-                )
-            ]
-        ),
-    )
-
     return LaunchDescription([
-        ins_search,
         go_to_frame,
         exec_ik_move,
         gripper_control,
-        rlr_bringup,
-        voice_rec,
+        #TO-DO: transfer to assistant behavior
         water_proc
     ])

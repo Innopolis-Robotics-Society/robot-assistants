@@ -27,8 +27,8 @@ cameras:
     camera_info: "calibration/mook_laptop_camera.yaml"
     frame_id: "mook_laptop_camera_optical_frame"
     tf:
-      parent_frame: "base_link"
-      xyz: [0.10, 0.05, 0.20]
-      rpy: [0.0, 0.0, 0.0]
+      parent_frame: "tool0_controller"
+      xyz: [0.046, 0.0, 0.0]
+      rpy: [1.5708, 3.1416, 0.0]   # roll, pitch, yaw (рад)
     params:
       image_size: [640, 480]
