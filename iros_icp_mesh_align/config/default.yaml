@@ -1,0 +1,5 @@
+icp_server:
+  ros__parameters:
+    ref_path: /home/mobile/ros2_ws/src/iros_icp_mesh_align/models/case_well.stl
+    scan_path: /home/mobile/ros2_ws/src/iros_icp_mesh_align/models/case_crack_1.stl
+    out_dir: /tmp/icp_out
