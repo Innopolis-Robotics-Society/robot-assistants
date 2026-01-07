@@ -93,7 +93,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip \
     "numpy<2" \
     sounddevice \
     vosk \
-    pyaudio 
+    pyaudio \
+    open3d \
+    matplotlib \
+    pyyaml
 
 # Clean up
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*
