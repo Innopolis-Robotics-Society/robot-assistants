@@ -207,7 +207,7 @@ class PointCloudAccumulator(Node):
         self.declare_parameter("cloud_topic", "/points2")
         self.declare_parameter("target_frame", "base_link")
         self.declare_parameter("use_latest_tf", True)
-        self.declare_parameter("max_cloud_age_sec", 0.5)
+        self.declare_parameter("max_cloud_age_sec", 1.5)
 
         # Cropping
         self.declare_parameter("enable_crop", False)  # IMPORTANT: default off to avoid 0 points
