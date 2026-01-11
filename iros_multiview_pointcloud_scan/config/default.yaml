@@ -1,0 +1,11 @@
+pointcloud_accumulator:
+  ros__parameters:
+    cloud_topic: /points2
+    target_frame: base_link
+    roi_min: [0.35,-0.15,0.00]
+    roi_max: [0.75, 0.15,0.35]
+    override_z_min: true
+    z_min_value: 0.01
+    voxel_size_capture: 0.002
+    voxel_size_global: 0.002
+    input_scale: 1.0

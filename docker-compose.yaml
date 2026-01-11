@@ -23,6 +23,7 @@ services:
     stdin_open: true
     tty: true
     devices:
+      - /dev/bus/usb:/dev/bus/usb
       - /dev/video0:/dev/video0
       - /dev/video1:/dev/video1
       - /dev/snd:/dev/snd

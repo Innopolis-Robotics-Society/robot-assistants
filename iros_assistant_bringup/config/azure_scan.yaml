@@ -1,0 +1,31 @@
+/**:
+  ros__parameters:
+    # Streams
+    depth_enabled: true
+    color_enabled: true
+
+    # Point cloud
+    point_cloud: true
+    rgb_point_cloud: true
+    # Для красивого цветного облака обычно удобнее строить облако в цветовой СК
+    point_cloud_in_depth_frame: false
+
+    # Depth mode for close range / max detail
+    depth_mode: WFOV_UNBINNED
+    fps: 15
+
+    # Units (avoid mm vs m mismatch later)
+    depth_unit: 32FC1
+
+    # Color (balanced quality vs CPU)
+    color_resolution: 1080P
+    color_format: jpeg
+
+    # Not needed for scanning; reduce traffic if you don't use IMU heavily
+    imu_rate_target: 100
+
+    # No wired sync in a single-camera setup
+    wired_sync_mode: 0
+
+    # Leave as default
+    body_tracking_smoothing_factor: 0.0
