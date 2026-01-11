@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-# ROS 2 Humble (rclpy)
-#
-# Orchestrator node:
-# 1) (optional) /cloud_accumulator/reset
-# 2) for frame in [view_0..view_5]:
-#       call /go_to_frame (GoToFrame) -> wait success
-#       sleep settle_time
-#       call /cloud_accumulator/capture (Trigger)  [recommended for multi-view merge]
-#       (optional) call /cloud_accumulator/save after each view (with save_path template)
-# 3) call /cloud_accumulator/save once at the end
-#
-# Start:
-#   ros2 run <your_pkg> scan_sequence_runner
-#   ros2 service call /scan_sequence_runner/run std_srvs/srv/Trigger {}
+# -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
@@ -27,54 +14,72 @@ from std_srvs.srv import Trigger
 
 from iros_assistant_bringup.srv import GoToFrame
 
-# Optional: set /cloud_accumulator parameter save_path to save per-view files
 from rcl_interfaces.srv import SetParameters
-from rcl_interfaces.msg import Parameter, ParameterValue
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 
 
 def wait_future(fut, timeout_sec: float) -> Tuple[bool, Optional[object]]:
-    """Wait until future done. Main executor must be spinning elsewhere."""
     t0 = time.time()
-    while time.time() - t0 < timeout_sec:
+    while (time.time() - t0) < timeout_sec:
         if fut.done():
             return True, fut.result()
         time.sleep(0.01)
     return False, None
 
 
-class ScanSequenceRunner(Node):
+class PcCapture(Node):
+    """
+    Sequence:
+      reset (optional)
+      for each view_i:
+        go_to_frame(view_i) -> wait success
+        sleep post_move_wait_sec
+        capture (Trigger)
+      set save_path (optional)
+      save (Trigger)
+    """
+
     def __init__(self) -> None:
-        super().__init__("scan_sequence_runner")
+        super().__init__("pc_capture")
 
-        # Parameters
-        self.declare_parameter("frames", ["view_0", "view_1", "view_2", "view_3", "view_4", "view_5"])
+        # Frames
+        self.declare_parameter("frames", ["view_0", "view_1", "view_2", "view_3", "view_4"])
 
+        # Motion service
         self.declare_parameter("go_to_frame_service", "/go_to_frame")
         self.declare_parameter("go_timeout_sec", 120.0)
 
-        # Cloud accumulator services (from your accumulator node)
+        # Accumulator
+        self.declare_parameter("acc_node_name", "/pointcloud_accumulator")
         self.declare_parameter("acc_reset_service", "/pointcloud_accumulator/reset")
         self.declare_parameter("acc_capture_service", "/pointcloud_accumulator/capture")
         self.declare_parameter("acc_save_service", "/pointcloud_accumulator/save")
         self.declare_parameter("acc_publish_service", "/pointcloud_accumulator/publish")  # optional
 
+        # Behavior
         self.declare_parameter("do_reset", True)
         self.declare_parameter("do_capture_each_view", True)
         self.declare_parameter("do_publish_end", False)
 
-        self.declare_parameter("settle_time_sec", 0.35)
-        self.declare_parameter("trigger_timeout_sec", 10.0)
+        # Delay after arrival (lets TF/pointcloud settle)
+        self.declare_parameter("post_move_wait_sec", 2.0)
 
-        # Optional: save after each view by updating accumulator param save_path
+        # Timeouts
+        self.declare_parameter("trigger_timeout_sec", 15.0)
+
+        # Saving
         self.declare_parameter("save_each_view", False)
-        self.declare_parameter("acc_node_name", "/pointcloud_accumulator")  # node name for set_parameters
         self.declare_parameter("save_path_template", "/tmp/scan_{frame}.ply")
         self.declare_parameter("save_path_end", "/tmp/scan_merged.ply")
+        self.declare_parameter("set_save_path_via_params", True)  # if False: just call /save
 
+        # Read params
         self.frames: List[str] = list(self.get_parameter("frames").value)
+
         self.go_srv = str(self.get_parameter("go_to_frame_service").value)
         self.go_timeout = float(self.get_parameter("go_timeout_sec").value)
 
+        self.acc_node_name = str(self.get_parameter("acc_node_name").value)
         self.acc_reset_srv = str(self.get_parameter("acc_reset_service").value)
         self.acc_capture_srv = str(self.get_parameter("acc_capture_service").value)
         self.acc_save_srv = str(self.get_parameter("acc_save_service").value)
@@ -84,26 +89,25 @@ class ScanSequenceRunner(Node):
         self.do_capture_each_view = bool(self.get_parameter("do_capture_each_view").value)
         self.do_publish_end = bool(self.get_parameter("do_publish_end").value)
 
-        self.settle_time = float(self.get_parameter("settle_time_sec").value)
+        self.post_move_wait = float(self.get_parameter("post_move_wait_sec").value)
         self.trig_timeout = float(self.get_parameter("trigger_timeout_sec").value)
 
         self.save_each_view = bool(self.get_parameter("save_each_view").value)
-        self.acc_node_name = str(self.get_parameter("acc_node_name").value)
         self.save_path_template = str(self.get_parameter("save_path_template").value)
         self.save_path_end = str(self.get_parameter("save_path_end").value)
+        self.set_save_path_via_params = bool(self.get_parameter("set_save_path_via_params").value)
 
         # Clients
         self.go_cli = self.create_client(GoToFrame, self.go_srv)
-
         self.reset_cli = self.create_client(Trigger, self.acc_reset_srv)
         self.capture_cli = self.create_client(Trigger, self.acc_capture_srv)
         self.save_cli = self.create_client(Trigger, self.acc_save_srv)
         self.publish_cli = self.create_client(Trigger, self.acc_publish_srv)
 
-        # Parameter set client for accumulator (optional)
+        # Param service client on accumulator
         self.set_params_cli = self.create_client(SetParameters, f"{self.acc_node_name}/set_parameters")
 
-        # Control services
+        # Control
         self.srv_run = self.create_service(Trigger, "~/run", self._run_cb)
         self.srv_stop = self.create_service(Trigger, "~/stop", self._stop_cb)
 
@@ -117,7 +121,9 @@ class ScanSequenceRunner(Node):
             f"go_to_frame={self.go_srv}\n"
             f"acc: reset={self.acc_reset_srv} capture={self.acc_capture_srv} save={self.acc_save_srv}\n"
             f"do_reset={self.do_reset} do_capture_each_view={self.do_capture_each_view}\n"
-            f"save_each_view={self.save_each_view} save_end={self.save_path_end}"
+            f"post_move_wait_sec={self.post_move_wait}\n"
+            f"save_each_view={self.save_each_view} save_end={self.save_path_end}\n"
+            f"set_save_path_via_params={self.set_save_path_via_params}"
         )
 
     # ------------------ control ------------------
@@ -131,7 +137,7 @@ class ScanSequenceRunner(Node):
             self._running = True
             self._stop_requested = False
 
-        # Quick availability checks
+        # Check services exist
         if not self.go_cli.wait_for_service(timeout_sec=2.0):
             self._set_running(False)
             resp.success = False
@@ -139,9 +145,9 @@ class ScanSequenceRunner(Node):
             return resp
 
         for cli, name in [
-            (self.save_cli, self.acc_save_srv),
-            (self.capture_cli, self.acc_capture_srv),
             (self.reset_cli, self.acc_reset_srv),
+            (self.capture_cli, self.acc_capture_srv),
+            (self.save_cli, self.acc_save_srv),
         ]:
             if not cli.wait_for_service(timeout_sec=2.0):
                 self._set_running(False)
@@ -149,11 +155,9 @@ class ScanSequenceRunner(Node):
                 resp.message = f"Service not available: {name}"
                 return resp
 
-        if self.save_each_view and not self.set_params_cli.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn(
-                f"save_each_view=true but {self.acc_node_name}/set_parameters not available; "
-                f"will still run but per-view save will fail."
-            )
+        # set_parameters is optional; if missing, we still run and just call /save
+        if self.set_save_path_via_params:
+            self.set_params_cli.wait_for_service(timeout_sec=0.5)
 
         self._worker = threading.Thread(target=self._run_sequence, daemon=True)
         self._worker.start()
@@ -197,15 +201,19 @@ class ScanSequenceRunner(Node):
 
     def _set_acc_save_path(self, path: str) -> Tuple[bool, str]:
         if not self.set_params_cli.service_is_ready():
-            return False, "set_parameters service not ready"
+            return False, "set_parameters not available"
 
         req = SetParameters.Request()
+
         p = Parameter()
         p.name = "save_path"
+
         pv = ParameterValue()
-        pv.type = ParameterValue.TYPE_STRING
+        # FIX for ROS2 Humble:
+        pv.type = ParameterType.PARAMETER_STRING
         pv.string_value = path
         p.value = pv
+
         req.parameters = [p]
 
         fut = self.set_params_cli.call_async(req)
@@ -220,7 +228,6 @@ class ScanSequenceRunner(Node):
 
     def _run_sequence(self) -> None:
         try:
-            # Optional reset
             if self.do_reset:
                 ok, msg = self._call_trigger(self.reset_cli, self.trig_timeout)
                 if not ok:
@@ -233,17 +240,15 @@ class ScanSequenceRunner(Node):
                     self.get_logger().warn("Stopped by request.")
                     return
 
-                # Move
                 ok, msg = self._call_go_to_frame(frame)
                 if not ok:
                     self.get_logger().error(f"go_to_frame({frame}) failed: {msg}")
                     return
                 self.get_logger().info(f"arrived {frame}: {msg}")
 
-                # settle
-                time.sleep(self.settle_time)
+                if self.post_move_wait > 0.0:
+                    time.sleep(self.post_move_wait)
 
-                # Capture cloud at this view (recommended for multi-view merge)
                 if self.do_capture_each_view:
                     ok, msg = self._call_trigger(self.capture_cli, self.trig_timeout)
                     if not ok:
@@ -251,15 +256,14 @@ class ScanSequenceRunner(Node):
                         return
                     self.get_logger().info(f"capture {frame}: {msg}")
 
-                # Optional save after each view (requires accumulator param save_path)
                 if self.save_each_view:
                     path = self.save_path_template.format(frame=frame)
                     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
-                    ok, msg = self._set_acc_save_path(path)
-                    if not ok:
-                        self.get_logger().error(f"set save_path failed at {frame}: {msg}")
-                        return
+                    if self.set_save_path_via_params:
+                        ok, msg = self._set_acc_save_path(path)
+                        if not ok:
+                            self.get_logger().warn(f"set save_path failed at {frame}: {msg} (will still call /save)")
 
                     ok, msg = self._call_trigger(self.save_cli, self.trig_timeout)
                     if not ok:
@@ -267,19 +271,20 @@ class ScanSequenceRunner(Node):
                         return
                     self.get_logger().info(f"saved {frame} -> {path}: {msg}")
 
-            # End: save merged cloud
-            # Set save_path_end (optional; depends on your accumulator supporting save_path param)
+            # Final save
             if self.save_path_end:
                 os.makedirs(os.path.dirname(self.save_path_end) or ".", exist_ok=True)
-                ok, msg = self._set_acc_save_path(self.save_path_end)
-                if not ok:
-                    self.get_logger().warn(f"Could not set save_path_end ({self.save_path_end}): {msg}")
 
-            ok, msg = self._call_trigger(self.save_cli, self.trig_timeout)
-            if not ok:
-                self.get_logger().error(f"final save failed: {msg}")
-                return
-            self.get_logger().info(f"final save: {msg} (path={self.save_path_end})")
+                if self.set_save_path_via_params:
+                    ok, msg = self._set_acc_save_path(self.save_path_end)
+                    if not ok:
+                        self.get_logger().warn(f"set save_path_end failed: {msg} (will still call /save)")
+
+                ok, msg = self._call_trigger(self.save_cli, self.trig_timeout)
+                if not ok:
+                    self.get_logger().error(f"final save failed: {msg}")
+                    return
+                self.get_logger().info(f"final save: {msg} (path={self.save_path_end})")
 
             if self.do_publish_end and self.publish_cli.service_is_ready():
                 ok, msg = self._call_trigger(self.publish_cli, self.trig_timeout)
@@ -288,18 +293,23 @@ class ScanSequenceRunner(Node):
                 else:
                     self.get_logger().warn(f"publish failed: {msg}")
 
+        except Exception as e:
+            # Do not crash silently
+            self.get_logger().error(f"Unhandled exception in sequence: {repr(e)}")
         finally:
             self._set_running(False)
             self.get_logger().info("Sequence finished.")
 
-def main():
+
+def main() -> None:
     rclpy.init()
-    node = ScanSequenceRunner()
+    node = PcCapture()
     try:
         rclpy.spin(node)
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()
