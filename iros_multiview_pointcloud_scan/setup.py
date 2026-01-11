@@ -1,6 +1,7 @@
 from setuptools import find_packages, setup
 from glob import glob
-package_name = 'iros_icp_mesh_align'
+
+package_name = 'iros_multiview_pointcloud_scan'
 
 setup(
     name=package_name,
@@ -26,8 +27,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-        "icp_test_pc = iros_icp_mesh_align.test_pc:main",
-        "icp_server = iros_icp_mesh_align.ros_node:main",
+            "pointcloud_accumulator = iros_multiview_pointcloud_scan.pointcloud_acc:main",
+            "pc_capture = iros_multiview_pointcloud_scan.pc_capture:main"
         ],
     },
 )

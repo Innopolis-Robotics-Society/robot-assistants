@@ -1,5 +1,30 @@
-icp_server:
+icp_service:
   ros__parameters:
-    ref_path: /home/mobile/ros2_ws/src/iros_icp_mesh_align/models/case_well.stl
-    scan_path: /home/mobile/ros2_ws/src/iros_icp_mesh_align/models/case_crack_1.stl
-    out_dir: /tmp/icp_out
+    # Topics
+    scan_topic: /icp/scan_cloud
+    heatmap_topic: /icp/heatmap_cloud
+
+    # Reference mesh (STL usually in mm -> convert to meters)
+    ref_mesh_path: ""          # set via launch or ros2 param set / service
+    ref_mesh_scale: 0.001      # mm -> m
+    ref_sample_points: 200000
+
+    # Processing (meters)
+    voxel_size: 0.002          # 2 mm
+    max_corr_mult: 5.0         # max correspondence = voxel_size * max_corr_mult
+    icp_max_iter: 50
+    prealign_centroids: true
+
+    # Size mismatch policy (no scaling)
+    size_ratio_fail_gt: 3.0
+    size_ratio_fail_lt: 0.33
+    size_ratio_warn_gt: 1.25
+    size_ratio_warn_lt: 0.80
+
+    # QoS (latched static cloud)
+    use_transient_local_qos: true
+
+    # Heatmap + debug
+    heat_vmax: 0.01            # 10 mm
+    debug_save_dir: /tmp/icp_out
+    debug_save_ply: true
