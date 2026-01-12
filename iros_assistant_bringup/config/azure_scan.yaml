@@ -7,7 +7,7 @@
     # Point cloud
     point_cloud: true
     rgb_point_cloud: true
-    # Для красивого цветного облака обычно удобнее строить облако в цветовой СК
+
     point_cloud_in_depth_frame: false
 
     # Depth mode for close range / max detail
