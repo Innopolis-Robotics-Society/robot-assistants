@@ -1,6 +1,6 @@
 cameras:
   marat_camera:
-    video_device: "/dev/v4l/by-id/usb-XXXXXX-video-index0"
+    video_device: "/dev/v4l/by-id/usb-046d_0825_4548E1B0-video-index0"
     camera_info: "calibration/marat_camera.yaml"
     frame_id: "marat_camera_optical_frame"
     tf:
@@ -10,7 +10,7 @@ cameras:
     params:
       image_size: [1280, 720]
 
-  enya_camera:
+  senya_camera:
     video_device: "/dev/v4l/by-id/usb-YYYYYY-video-index0"
     camera_info: "calibration/senya_camera.yaml"
     frame_id: "senya_camera_optical_frame"
