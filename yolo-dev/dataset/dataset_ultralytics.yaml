@@ -1,0 +1,5 @@
+path: /home/artyom/Personal/inno_study/robot-assistants/yolo-dev/dataset
+train: train/images
+val: valid/images
+nc: 13
+names: ['base', 'blue-board', 'blue-led', 'capacitor', 'digit-board', 'esp', 'green-board', 'green-led', 'purple-board', 'red-led', 'resistor-big', 'resistor-small', 'yellow-led']
