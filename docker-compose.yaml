@@ -19,9 +19,11 @@ x-common: &common-setup
 services:
   terminal:
     <<: *common-setup
-    image: fabook/cv:v0.0.2
+    image: fabook/cv:v0.0.3
     stdin_open: true
     tty: true
+    gpus: all
+    runtime: nvidia
     devices:
       - /dev/bus/usb:/dev/bus/usb
       - /dev/video0:/dev/video0
