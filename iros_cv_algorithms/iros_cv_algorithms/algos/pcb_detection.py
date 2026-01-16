@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .interface import CvAlgorithm
 
@@ -27,17 +27,11 @@ def _rel_diff(a: float, b: float, eps: float = 1e-9) -> float:
 
 class PCBDetectionAlgorithm(CvAlgorithm):
     """
-    Calibration on first use:
-      - collect N signatures from N frames
-      - choose baseline signature
-      - compute per-object tolerances as max observed deviations (+ margins), with minimal floors
-
-    Runtime:
-      - strict counts per class
-      - per-object geometry check (dx/dy + relative dw/dh)
-      - distances-to-anchors (simple global check)
-
-    Additionally returns `detections` (YOLO normalized boxes) so the node can draw/save overlays.
+    Output fields added:
+      - match: bool        (True only during baseline creation)
+      - pred: list[{class,x,y,w,h,conf}]  (all YOLO detections)
+      - anchor: {class,x,y,w,h,conf} | None
+      - anchor_class: str
     """
 
     def __init__(
@@ -47,6 +41,9 @@ class PCBDetectionAlgorithm(CvAlgorithm):
         conf_thr: float = 0.25,
         iou_thr: float = 0.5,
         device: str = "0",
+        # anchor
+        anchor_class: str = "base",       # класс, который всегда должен быть на плате
+        require_anchor: bool = True,      # если True и anchor не найден -> ok=False
         # tolerance floors
         min_pos_tol: float = 0.02,
         min_size_tol: float = 0.25,
@@ -60,6 +57,9 @@ class PCBDetectionAlgorithm(CvAlgorithm):
         self._iou_thr = float(iou_thr)
         self._device = device
 
+        self._anchor_class = str(anchor_class)
+        self._require_anchor = bool(require_anchor)
+
         self._calib_need = max(1, int(calib_samples))
         self._min_pos_tol = float(min_pos_tol)
         self._min_size_tol = float(min_size_tol)
@@ -71,38 +71,63 @@ class PCBDetectionAlgorithm(CvAlgorithm):
         self._lock = threading.Lock()
         self._calib_buf: List[Dict[str, List[_Feat]]] = []
 
-        # baseline state
+        # baseline state (already normalized relative-to-anchor)
         self._baseline_sig: Optional[Dict[str, List[_Feat]]] = None
         self._baseline_counts: Optional[Dict[str, int]] = None
-        self._tol_geom: Optional[Dict[str, List[Dict[str, float]]]] = None  # per class, per index
+        self._tol_geom: Optional[Dict[str, List[Dict[str, float]]]] = None
         self._anchors: Optional[List[int]] = None
         self._tol_dist: Optional[float] = None
 
-        from ultralytics import YOLO  # dependency
+        from ultralytics import YOLO
 
         if model_path is None:
             model_path = str(Path(__file__).resolve().parent / "models" / "yolo12s-pcb.pt")
 
-        self._model_path = model_path
-        self._model = YOLO(self._model_path)
+        self._model = YOLO(model_path)
 
     @property
     def key(self) -> str:
         return "pcb_detection"
 
     def run(self, image_bgr) -> Dict[str, Any]:
-        feats = self._infer(image_bgr)
+        feats_abs = self._infer(image_bgr)
+        pred = [{"class": f.cls, "x": f.x, "y": f.y, "w": f.w, "h": f.h, "conf": f.conf} for f in feats_abs]
+
+        anchor = self._select_anchor(feats_abs)
+        anchor_out = None
+        if anchor is not None:
+            anchor_out = {
+                "class": anchor.cls,
+                "x": anchor.x, "y": anchor.y, "w": anchor.w, "h": anchor.h,
+                "conf": anchor.conf,
+            }
+
+        if anchor is None and self._require_anchor:
+            return {
+                "baseline_set": self._baseline_sig is not None,
+                "calibrating": False,
+                "match": self._baseline_sig is None,  # если эталон ещё не строили — мы "в режиме эталона"
+                "ok": False,
+                "reason": "anchor_missing",
+                "anchor_class": self._anchor_class,
+                "anchor": None,
+                "pred": pred,
+            }
+
+        feats = self._normalize_relative_to_anchor(feats_abs, anchor)
         sig = self._build_signature(feats)
-        dets_out = [asdict(f) for f in feats]  # for node overlays
 
         with self._lock:
-            # already calibrated
+            # runtime (baseline already exists)
             if self._baseline_sig is not None:
                 out = self._check(sig)
-                out["detections"] = dets_out
+                out["match"] = False
+                out["anchor_class"] = self._anchor_class
+                out["anchor"] = anchor_out
+                out["pred"] = pred
                 return out
 
-            # calibrating
+            # baseline creation
             self._calib_buf.append(sig)
             have = len(self._calib_buf)
             need = self._calib_need
@@ -111,12 +136,14 @@ class PCBDetectionAlgorithm(CvAlgorithm):
                 return {
                     "baseline_set": False,
                     "calibrating": True,
+                    "match": True,
                     "progress": {"have": have, "need": need},
                     "counts_now": {k: len(v) for k, v in sig.items()},
-                    "detections": dets_out,
+                    "anchor_class": self._anchor_class,
+                    "anchor": anchor_out,
+                    "pred": pred,
                 }
 
-            # build baseline now
             ok = self._build_baseline(self._calib_buf)
             self._calib_buf.clear()
 
@@ -124,22 +151,64 @@ class PCBDetectionAlgorithm(CvAlgorithm):
                 return {
                     "baseline_set": False,
                     "calibrating": False,
+                    "match": True,
                     "ok": False,
                     "reason": "baseline_build_failed_retry",
-                    "detections": dets_out,
+                    "anchor_class": self._anchor_class,
+                    "anchor": anchor_out,
+                    "pred": pred,
                 }
 
             return {
                 "baseline_set": True,
                 "calibrating": False,
+                "match": True,
                 "ok": True,
                 "reason": "baseline_created",
                 "counts_ref": self._baseline_counts,
                 "dist_tol": self._tol_dist,
-                "anchors": self._anchors,
-                "geom_tol_summary": self._tol_geom,  # can be big, but useful for debugging
-                "detections": dets_out,
+                "anchor_class": self._anchor_class,
+                "anchor": anchor_out,
+                "pred": pred,
             }
+
+    # ---------------- anchor + normalization ----------------
+
+    def _select_anchor(self, feats: List[_Feat]) -> Optional[_Feat]:
+        """Выбираем якорь: среди anchor_class берём самый уверенный (или largest area при равенстве)."""
+        if not feats:
+            return None
+        cand = [f for f in feats if f.cls == self._anchor_class]
+        if not cand:
+            return None
+        return max(cand, key=lambda f: (f.conf, f.w * f.h))
+
+    def _normalize_relative_to_anchor(self, feats: List[_Feat], anchor: Optional[_Feat]) -> List[_Feat]:
+        """
+        Делает координаты и размеры относительными:
+          x' = x - ax
+          y' = y - ay
+          w' = w / aw
+          h' = h / ah
+        Если anchor None — возвращаем как есть (для require_anchor=False).
+        """
+        if anchor is None:
+            return feats
+        aw = max(anchor.w, 1e-6)
+        ah = max(anchor.h, 1e-6)
+        ax, ay = anchor.x, anchor.y
+
+        out: List[_Feat] = []
+        for f in feats:
+            out.append(_Feat(
+                cls=f.cls,
+                x=f.x - ax,
+                y=f.y - ay,
+                w=f.w / aw,
+                h=f.h / ah,
+                conf=f.conf,
+            ))
+        return out
 
     # ---------------- baseline build / runtime checks ----------------
 
@@ -150,7 +219,6 @@ class PCBDetectionAlgorithm(CvAlgorithm):
         base = max(sigs, key=total)
         base_counts = {k: len(v) for k, v in base.items()}
 
-        # keep only samples that match baseline counts exactly
         good = []
         for s in sigs:
             c = {k: len(v) for k, v in s.items()}
@@ -160,7 +228,6 @@ class PCBDetectionAlgorithm(CvAlgorithm):
         if len(good) < 2:
             return False
 
-        # per-object tolerances
         tol_geom: Dict[str, List[Dict[str, float]]] = {}
         for cls, base_list in base.items():
             tol_geom[cls] = []
@@ -184,7 +251,6 @@ class PCBDetectionAlgorithm(CvAlgorithm):
                     "dh": max(self._min_size_tol, max_dh + self._size_margin),
                 })
 
-        # anchors + global distance tolerance
         base_all = self._flatten_sorted(base)
         n = len(base_all)
         if n >= 2:
@@ -222,7 +288,6 @@ class PCBDetectionAlgorithm(CvAlgorithm):
         assert self._anchors is not None
         assert self._tol_dist is not None
 
-        # counts strict
         cur_counts = {k: len(v) for k, v in cur.items()}
         if cur_counts != self._baseline_counts:
             return {
@@ -233,7 +298,6 @@ class PCBDetectionAlgorithm(CvAlgorithm):
                 "counts_cur": cur_counts,
             }
 
-        # geometry
         mism = []
         for cls, base_list in self._baseline_sig.items():
             cur_list = cur[cls]
@@ -259,7 +323,6 @@ class PCBDetectionAlgorithm(CvAlgorithm):
                 "mismatches": mism[:50],
             }
 
-        # distances
         base_all = self._flatten_sorted(self._baseline_sig)
         cur_all = self._flatten_sorted(cur)
         bad = []
@@ -303,7 +366,11 @@ class PCBDetectionAlgorithm(CvAlgorithm):
         feats: List[_Feat] = []
         for (x, y, w, h), c, p in zip(xywhn, cls, conf):
             cls_name = str(names.get(int(c), str(int(c))))
-            feats.append(_Feat(cls=cls_name, x=float(x), y=float(y), w=float(w), h=float(h), conf=float(p)))
+            feats.append(_Feat(
+                cls=cls_name,
+                x=float(x), y=float(y), w=float(w), h=float(h),
+                conf=float(p),
+            ))
         return feats
 
     def _build_signature(self, feats: List[_Feat]) -> Dict[str, List[_Feat]]:

@@ -13,6 +13,9 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetReferenceMesh.srv"
   "msg/ICPAlignmentStatistic.msg"
+  "msg/Statistics.msg"
+  "msg/Detection2D.msg"
+  "msg/PcbCheck.msg"
   DEPENDENCIES std_msgs
 )
 
