@@ -1,0 +1,40 @@
+# iros_object_scanner/config/sphere_pose_generator.yaml
+sphere_pose_generator_node:
+  ros__parameters:
+    base_frame: "base_link"
+    object_frame: "object_frame"
+    tcp_frame: "tool0_controller"
+    camera_frame: "camera_base"
+
+    # центр объекта в base_frame
+    object_center_xyz: [0.41, 0.724, 0.07]
+    object_orientation_quat: [0.0, 0.0, 0.0, 1.0]
+
+    # сфера
+    radius_m: 0.25
+    n_poses: 6
+    sampling: "fibonacci"                # fibonacci | latlong | random
+    azimuth_deg: [0.0, -180.0]
+    elevation_deg: [20.0, 75.0]          # полусфера сверху
+
+    # "верх" мира
+    up_vector_base: [0.0, 0.0, 1.0]
+
+    # оси камеры (обычно optical: look=+Z, up=-Y)
+    look_axis_cam: [1.0, 0.0, 0.0]
+    up_axis_cam:   [0.0, 0.0, -1.0]
+
+
+    # как получить TCP->CAM
+    use_tf_tcp_to_camera: false           # если TF есть
+    tcp_to_camera_xyz: [0.0, 0.0, 0.0]   # иначе задай руками
+    tcp_to_camera_quat: [0.707, 0.000, -0.707, 0.000]
+
+    # выход
+    pose_prefix: "scan_pose_"
+    pose_digits: 5
+    append_epoch_to_prefix: true         # чтобы "clear" работал без коллизий
+    publish_camera_frames: false
+    publish_tf_static: true
+    auto_generate_on_startup: true
+    seed: 0
