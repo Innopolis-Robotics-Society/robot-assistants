@@ -13,6 +13,7 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>cv_bridge</depend>
+  <depend>iros_custom_msgs</depend>
 
   <!-- launch deps (for running .launch.py files) -->
   <exec_depend>launch</exec_depend>

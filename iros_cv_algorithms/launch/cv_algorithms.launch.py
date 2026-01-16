@@ -50,13 +50,13 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("mode", default_value="trigger", description="trigger|timer"),
-        DeclareLaunchArgument("image_topic", default_value="/image"),
+        DeclareLaunchArgument("mode", default_value="timer", description="trigger|timer"),
+        DeclareLaunchArgument("image_topic", default_value="/rgb/image_raw"),
         DeclareLaunchArgument("image_timeout_s", default_value="2.0"),
         DeclareLaunchArgument("result_prefix", default_value="/cv_algorithms/result"),
         DeclareLaunchArgument("trigger_topic", default_value="/cv_algorithms/run"),
         DeclareLaunchArgument("trigger_service", default_value="/cv_algorithms/run"),
-        DeclareLaunchArgument("process_period_s", default_value="1.0"),
+        DeclareLaunchArgument("process_period_s", default_value="2.0"),
 
         timer_node,
         trigger_node,
