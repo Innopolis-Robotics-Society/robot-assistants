@@ -170,5 +170,10 @@ USER $USERNAME
 
 RUN mkdir -p /home/$USERNAME/ros2_ws/src
 
+COPY extras/python_api_1.4.1.zip /tmp/python_api_1.4.1.zip
+RUN pip3 install /tmp/python_api_1.4.1.zip && \
+    sudo rm /tmp/python_api_1.4.1.zip
+
+
 CMD ["bash"]
 #docker build -t image_name -f Dockerfile .

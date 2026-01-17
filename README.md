@@ -176,9 +176,9 @@ If your CV launch expects rectified images:
 
 ## Services (iros_assistant_bringup)
 
-Service definitions live in: `iros_assistant_bringup/srv/`
+Service definitions live in: `iros_custom_msgs/srv/`
 
-### `DetectObject` (`iros_assistant_bringup/srv/DetectObject.srv`)
+### `DetectObject` (`iros_custom_msgs/srv/DetectObject.srv`)
 
 Request:
 ```text
@@ -205,12 +205,12 @@ Typical usage:
 Example call:
 
 ```bash
-ros2 service call /detect_object iros_assistant_bringup/srv/DetectObject "{class_name: 'hammer', duration: 5.0}"
+ros2 service call /detect_object iros_custom_msgs/srv/DetectObject "{class_name: 'hammer', duration: 5.0}"
 ```
 
 ---
 
-### `GoToFrame` (`iros_assistant_bringup/srv/GoToFrame.srv`)
+### `GoToFrame` (`iros_custom_msgs/srv/GoToFrame.srv`)
 
 Request:
 
@@ -232,12 +232,12 @@ Typical usage:
 Example call:
 
 ```bash
-ros2 service call /go_to_frame iros_assistant_bringup/srv/GoToFrame "{frame: 'pose_forward'}"
+ros2 service call /go_to_frame iros_custom_msgs/srv/GoToFrame "{frame: 'pose_forward'}"
 ```
 
 ---
 
-### `GripperAction` (`iros_assistant_bringup/srv/GripperAction.srv`)
+### `GripperAction` (`iros_custom_msgs/srv/GripperAction.srv`)
 
 Request:
 
@@ -259,13 +259,13 @@ Typical usage:
 Examples:
 
 ```bash
-ros2 service call /gripper_action iros_assistant_bringup/srv/GripperAction "{open: true}"
-ros2 service call /gripper_action iros_assistant_bringup/srv/GripperAction "{open: false}"
+ros2 service call /gripper_action iros_custom_msgs/srv/GripperAction "{open: true}"
+ros2 service call /gripper_action iros_custom_msgs/srv/GripperAction "{open: false}"
 ```
 
 ---
 
-### `MoveToPose` (`iros_assistant_bringup/srv/MoveToPose.srv`)
+### `MoveToPose` (`iros_custom_msgs/srv/MoveToPose.srv`)
 
 Request:
 
@@ -287,7 +287,7 @@ Typical usage:
 Example call:
 
 ```bash
-ros2 service call /move_to_pose iros_assistant_bringup/srv/MoveToPose "{
+ros2 service call /move_to_pose iros_custom_msgs/srv/MoveToPose "{
   target: {
     position: {x: 0.4, y: 0.0, z: 0.3},
     orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}

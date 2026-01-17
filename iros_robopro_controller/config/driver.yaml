@@ -1,0 +1,36 @@
+rc_robot_driver:
+  ros__parameters:
+    robot_ip: "192.168.0.15"
+    robot_timeout_sec: 5
+
+    world_frame: "world"
+    base_frame: "base_link"
+    flange_frame: "flange_link"
+    tool_frame: "tool0_controller"
+
+    # Static transform world -> base_link (set from your measurement/calibration)
+    world_to_base_xyz: [0.0, 0.0, 0.0]
+    world_to_base_rpy_deg: [0.0, 0.0, 180.0]
+
+    # TCP offset: static transform flange_link -> tool0
+    # (X,Y,Z in meters; R,P,Y in degrees)
+    flange_to_tool_xyz: [0.0, 0.0, 0.0]
+    flange_to_tool_rpy_deg: [0.0, 180.0, 45.0]
+    tool_offset_units: "deg"
+    set_tcp_on_start: true
+
+    # Motion defaults for go_to_frame
+    linear_speed: 0.3
+    linear_accel: 1.0
+    blend: 0.0
+    orientation_units: "deg"
+    move_await_sec: 30
+
+    # TF
+    tf_lookup_timeout_sec: 1.0
+    publish_rate_hz: 30.0
+
+    # Gripper DO backend: wrist or controller
+    gripper_backend: "controller"
+    gripper_pin0: 0
+    gripper_pin1: 1

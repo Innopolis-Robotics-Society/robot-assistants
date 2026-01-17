@@ -11,8 +11,8 @@
 #include "tf2_ros/transform_listener.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
-#include "iros_assistant_bringup/srv/move_to_pose.hpp"
-#include "iros_assistant_bringup/srv/go_to_frame.hpp"
+#include "iros_custom_msgs/srv/move_to_pose.hpp"
+#include "iros_custom_msgs/srv/go_to_frame.hpp"
 
 #include "rmw/qos_profiles.h"
 
@@ -43,7 +43,7 @@ int main(int argc, char** argv)
       rclcpp::CallbackGroupType::Reentrant);
 
   // Клиент к сервису go_to_tf (MoveToPose) в отдельной группе
-  using MoveToPose = iros_assistant_bringup::srv::MoveToPose;
+  using MoveToPose = iros_custom_msgs::srv::MoveToPose;
   auto go_to_tf_client = node->create_client<MoveToPose>(
       "go_to_tf",
       rmw_qos_profile_services_default,
@@ -69,7 +69,7 @@ int main(int argc, char** argv)
   };
 
   // Сервис, который принимает имя фрейма и запускает go_to_tf
-  using GoToFrame = iros_assistant_bringup::srv::GoToFrame;
+  using GoToFrame = iros_custom_msgs::srv::GoToFrame;
   auto service = node->create_service<GoToFrame>(
     "go_to_frame",
     [&, node, go_to_tf_client, base_frame, getTransform]

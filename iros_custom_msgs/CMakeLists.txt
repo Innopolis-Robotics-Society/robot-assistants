@@ -12,11 +12,16 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetReferenceMesh.srv"
+  "srv/DetectObject.srv"
+  "srv/GoToFrame.srv"
+  "srv/MoveToPose.srv"
+  "srv/GripperAction.srv"
+
   "msg/ICPAlignmentStatistic.msg"
   "msg/Statistics.msg"
   "msg/Detection2D.msg"
   "msg/PcbCheck.msg"
-  DEPENDENCIES std_msgs
+  DEPENDENCIES std_msgs geometry_msgs
 )
 
 if(BUILD_TESTING)
