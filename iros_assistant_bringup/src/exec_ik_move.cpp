@@ -18,7 +18,7 @@
 #include "tf2/LinearMath/Transform.h"
 #include "tf2/LinearMath/Quaternion.h"
 
-#include "iros_assistant_bringup/srv/move_to_pose.hpp"
+#include "iros_custom_msgs/srv/move_to_pose.hpp"
 
 using namespace std::chrono_literals;
 
@@ -84,7 +84,7 @@ int main(int argc, char** argv)
     throw std::runtime_error("Shutdown while waiting for transform");
   };
 
-  using iros_assistant_bringup::srv::MoveToPose;
+  using iros_custom_msgs::srv::MoveToPose;
 
   // Сервис: целевая поза TCP (tool0_controller) в base_frame
   auto service = node->create_service<MoveToPose>(

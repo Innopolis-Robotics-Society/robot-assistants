@@ -17,7 +17,7 @@ from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 from tf2_ros import TransformBroadcaster, Buffer, TransformListener, TransformException
 
-from iros_assistant_bringup.srv import DetectObject
+from iros_custom_msgs.srv import DetectObject
 
 # ==== CONFIG ====
 THIS_DIR = Path(__file__).resolve().parent

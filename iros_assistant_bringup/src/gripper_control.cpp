@@ -4,7 +4,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <ur_msgs/srv/set_io.hpp>
-#include "iros_assistant_bringup/srv/gripper_action.hpp"
+#include "iros_custom_msgs/srv/gripper_action.hpp"
 
 using namespace std::chrono_literals;
 
@@ -18,7 +18,7 @@ class GripperNode : public rclcpp::Node
 public:
   GripperNode() : Node("gripper_node")
   {
-    using GripperAction = iros_assistant_bringup::srv::GripperAction;
+    using GripperAction = iros_custom_msgs::srv::GripperAction;
     using SetIO         = ur_msgs::srv::SetIO;
 
     client_ = this->create_client<SetIO>("/io_and_status_controller/set_io");
@@ -68,7 +68,7 @@ public:
 
 private:
   rclcpp::Client<ur_msgs::srv::SetIO>::SharedPtr client_;
-  rclcpp::Service<iros_assistant_bringup::srv::GripperAction>::SharedPtr service_;
+  rclcpp::Service<iros_custom_msgs::srv::GripperAction>::SharedPtr service_;
 };
 
 int main(int argc, char** argv)

@@ -12,7 +12,7 @@ import rclpy
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 
-from iros_assistant_bringup.srv import GoToFrame
+from iros_custom_msgs.srv import GoToFrame
 
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType

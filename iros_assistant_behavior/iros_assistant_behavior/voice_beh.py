@@ -14,16 +14,16 @@ from tf2_ros import Buffer, TransformListener
 
 from std_srvs.srv import Trigger
 
-from iros_assistant_bringup.srv import GripperAction, GoToFrame, DetectObject
+from iros_custom_msgs.srv import GripperAction, GoToFrame, DetectObject
 
 
 class VoiceCommandExecutor(Node):
     """
     Нода: слушает voice/command и в зависимости от команды
     запускает сценарий движения манипулятора через сервисы:
-      - /gripper_action (iros_assistant_bringup/srv/GripperAction)
-      - /go_to_frame   (iros_assistant_bringup/srv/GoToFrame)
-      - /detect_object (iros_assistant_bringup/srv/DetectObject)
+      - /gripper_action (iros_custom_msgs/srv/GripperAction)
+      - /go_to_frame   (iros_custom_msgs/srv/GoToFrame)
+      - /detect_object (iros_custom_msgs/srv/DetectObject)
       - /setup_cups_frames (std_srvs/srv/Trigger)
 
     Шаги сценария:
