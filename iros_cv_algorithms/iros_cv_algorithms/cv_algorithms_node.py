@@ -34,7 +34,7 @@ class CvAlgorithmsNode(Node):
 
         self.declare_parameter("result_prefix", "/cv_algorithms/result")
 
-        self.declare_parameter("mode", "trigger")         # "trigger" | "timer"
+        self.declare_parameter("mode", "trigger")  # "trigger" | "timer"
         self.declare_parameter("process_period_s", 1.0)
 
         # pcb baseline sampling
@@ -44,6 +44,10 @@ class CvAlgorithmsNode(Node):
         # debug saving for pcb baseline
         self.declare_parameter("save_pcb_baseline_debug", True)
         self.declare_parameter("debug_images_dir", "/tmp//iros_cv_algorithms/debug_images")
+
+        # overlay publishing
+        self.declare_parameter("publish_overlay", True)
+        self.declare_parameter("overlay_prefix", "/cv_algorithms/overlay")
 
         # read params
         self._image_topic = self.get_parameter("image_topic").value
@@ -63,6 +67,9 @@ class CvAlgorithmsNode(Node):
             self._debug_images_dir = Path.cwd() / self._debug_images_dir
         if self._save_pcb_baseline_debug:
             self._debug_images_dir.mkdir(parents=True, exist_ok=True)
+
+        self._publish_overlay = bool(self.get_parameter("publish_overlay").value)
+        self._overlay_prefix = str(self.get_parameter("overlay_prefix").value)
 
         # triggers / timer
         if self._mode == "trigger":
@@ -96,6 +103,14 @@ class CvAlgorithmsNode(Node):
             if algo.key != "pcb_detection"
         }
 
+        # - overlay images (bgr8), per-algorithm:
+        #   /cv_algorithms/overlay/<algo_key>/image
+        self._pubs_overlay = {}
+        if self._publish_overlay:
+            for algo in self._algorithms:
+                topic = f"{self._overlay_prefix}/{algo.key}/image"
+                self._pubs_overlay[algo.key] = self.create_publisher(Image, topic, qos_profile_sensor_data)
+
         self._bridge = CvBridge()
 
         self._busy_lock = threading.Lock()
@@ -105,6 +120,8 @@ class CvAlgorithmsNode(Node):
             f"Ready. mode={self._mode}, image_topic={self._image_topic}, timeout={self._image_timeout_s}s, "
             f"trigger_service={self._trigger_service}, result_prefix={self._result_prefix}"
         )
+        if self._publish_overlay:
+            self.get_logger().info(f"Overlay enabled. overlay_prefix={self._overlay_prefix}")
         if self._save_pcb_baseline_debug:
             self.get_logger().info(f"PCB baseline debug dir: {self._debug_images_dir}")
 
@@ -197,24 +214,126 @@ class CvAlgorithmsNode(Node):
 
         self._pub_pcb.publish(msg)
 
+    # ---------------- overlay ----------------
+
+    def _draw_overlay_from_res(self, image_bgr, res: dict):
+        """
+        Универсально для детекций в формате:
+          res["pred"] = list[{class,x,y,w,h,conf}] (xywhn)
+        Опционально:
+          res["anchor"] = {class,x,y,w,h,conf} (xywhn) -> рисуем красным
+        """
+        if not isinstance(res, dict):
+            return None
+
+        preds = res.get("pred")
+        if not isinstance(preds, list) or len(preds) == 0:
+            return None
+
+        img = image_bgr.copy()
+        h, w = img.shape[:2]
+
+        # anchor (optional)
+        anchor = res.get("anchor") if isinstance(res.get("anchor"), dict) else None
+        if anchor is not None:
+            try:
+                ax = float(anchor.get("x", 0.0))
+                ay = float(anchor.get("y", 0.0))
+                aw = float(anchor.get("w", 0.0))
+                ah = float(anchor.get("h", 0.0))
+                acls = str(anchor.get("class", anchor.get("class_name", "")))
+                aconf = float(anchor.get("conf", 0.0))
+
+                x1 = int((ax - aw / 2.0) * w)
+                y1 = int((ay - ah / 2.0) * h)
+                x2 = int((ax + aw / 2.0) * w)
+                y2 = int((ay + ah / 2.0) * h)
+                x1 = max(0, min(w - 1, x1))
+                y1 = max(0, min(h - 1, y1))
+                x2 = max(0, min(w - 1, x2))
+                y2 = max(0, min(h - 1, y2))
+
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                label = f"ANCHOR {acls} {aconf:.2f}".strip()
+                cv2.putText(img, label, (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            except Exception:
+                pass
+
+        # detections
+        for p in preds:
+            if not isinstance(p, dict):
+                continue
+            try:
+                cls = str(p.get("class", p.get("class_name", "")))
+                conf = float(p.get("conf", 0.0))
+                x = float(p["x"])
+                y = float(p["y"])
+                bw = float(p["w"])
+                bh = float(p["h"])
+            except Exception:
+                continue
+
+            x1 = int((x - bw / 2.0) * w)
+            y1 = int((y - bh / 2.0) * h)
+            x2 = int((x + bw / 2.0) * w)
+            y2 = int((y + bh / 2.0) * h)
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
+
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"{cls} {conf:.2f}".strip() if cls else f"{conf:.2f}"
+            cv2.putText(img, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # small status text (optional)
+        reason = res.get("reason")
+        if isinstance(reason, str) and reason:
+            try:
+                cv2.putText(img, reason, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            except Exception:
+                pass
+
+        return img
+
+    def _publish_overlay_image(self, algo_key: str, img_msg: Image, overlay_bgr):
+        if not self._publish_overlay:
+            return
+        pub = self._pubs_overlay.get(algo_key)
+        if pub is None:
+            return
+        out_msg = self._bridge.cv2_to_imgmsg(overlay_bgr, encoding="bgr8")
+        out_msg.header = img_msg.header
+        pub.publish(out_msg)
+
+    # ---------------- pcb debug saving ----------------
+
     def _draw_and_save(self, image_bgr, preds: list, out_path: Path):
         img = image_bgr.copy()
         h, w = img.shape[:2]
         for p in preds or []:
             try:
                 cls = str(p.get("class", p.get("class_name", "")))
-                x = float(p["x"]); y = float(p["y"]); bw = float(p["w"]); bh = float(p["h"])
+                conf = float(p.get("conf", 0.0))
+                x = float(p["x"])
+                y = float(p["y"])
+                bw = float(p["w"])
+                bh = float(p["h"])
             except Exception:
                 continue
 
-            x1 = int((x - bw / 2.0) * w); y1 = int((y - bh / 2.0) * h)
-            x2 = int((x + bw / 2.0) * w); y2 = int((y + bh / 2.0) * h)
-            x1 = max(0, min(w - 1, x1)); y1 = max(0, min(h - 1, y1))
-            x2 = max(0, min(w - 1, x2)); y2 = max(0, min(h - 1, y2))
+            x1 = int((x - bw / 2.0) * w)
+            y1 = int((y - bh / 2.0) * h)
+            x2 = int((x + bw / 2.0) * w)
+            y2 = int((y + bh / 2.0) * h)
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
 
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            if cls:
-                cv2.putText(img, cls, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            label = f"{cls} {conf:.2f}".strip() if cls else f"{conf:.2f}"
+            cv2.putText(img, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         cv2.imwrite(str(out_path), img)
 
@@ -239,6 +358,8 @@ class CvAlgorithmsNode(Node):
         if res.get("reason") == "baseline_created" and res.get("baseline_set"):
             out_img = self._debug_images_dir / f"pcb_baseline_{stamp}_final.jpg"
             self._draw_and_save(image_bgr, preds, out_img)
+
+    # ---------------- main loop ----------------
 
     def _process_once(self):
         try:
@@ -266,10 +387,17 @@ class CvAlgorithmsNode(Node):
                     algo_ms = 0.0
                     algo_ok = False
 
-                # publish
+                # publish result
                 if algo.key == "pcb_detection":
                     self._publish_pcb(img_msg, grab_ms, convert_ms, algo_ms, algo_ok, res)
+
                     if isinstance(res, dict):
+                        # overlay
+                        overlay = self._draw_overlay_from_res(cv_bgr, res)
+                        if overlay is not None:
+                            self._publish_overlay_image(algo.key, img_msg, overlay)
+
+                        # baseline debug images
                         self._maybe_save_pcb_baseline_debug(cv_bgr, res)
                 else:
                     payload = {
@@ -281,6 +409,11 @@ class CvAlgorithmsNode(Node):
                         "result": res,
                     }
                     self._publish_str(algo.key, payload)
+
+                    if isinstance(res, dict):
+                        overlay = self._draw_overlay_from_res(cv_bgr, res)
+                        if overlay is not None:
+                            self._publish_overlay_image(algo.key, img_msg, overlay)
 
                 # pcb calibration extra frames
                 if algo.key == "pcb_detection" and isinstance(res, dict) and res.get("calibrating"):
@@ -308,7 +441,12 @@ class CvAlgorithmsNode(Node):
 
                         # grab_ms_b не пересчитываю (это второй кадр); можно оставить 0
                         self._publish_pcb(img_msg_b, 0.0, convert_ms_b, algo_ms_b, algo_ok_b, res_b)
+
                         if isinstance(res_b, dict):
+                            overlay_b = self._draw_overlay_from_res(cv_bgr_b, res_b)
+                            if overlay_b is not None:
+                                self._publish_overlay_image(algo.key, img_msg_b, overlay_b)
+
                             self._maybe_save_pcb_baseline_debug(cv_bgr_b, res_b)
 
                         if isinstance(res_b, dict) and not res_b.get("calibrating"):

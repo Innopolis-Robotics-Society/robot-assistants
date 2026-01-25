@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'iros_cv'
+package_name = 'iros_tool_recognition'
 
 setup(
     name=package_name,
@@ -24,8 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            "ins_search = iros_cv.ins_search:main",
-            "execute_rect_recognition = iros_cv.april_tag_scale:main"
+            "ins_search = iros_tool_recognition.ins_search:main",
+            "execute_rect_recognition = iros_tool_recognition.april_tag_scale:main"
         ],
     },
 )

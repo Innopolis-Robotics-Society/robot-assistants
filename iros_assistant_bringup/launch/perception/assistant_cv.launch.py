@@ -45,12 +45,12 @@ def generate_launch_description():
     )
 
     ins_search = Node(
-        package="iros_cv",
+        package="iros_tool_recognition",
         executable="ins_search",
         output="screen",
         parameters=[
             {
-                'model_path': '/home/mobile/ros2_ws/src/iros_cv/models/best_fixed.pt',
+                'model_path': '/home/mobile/ros2_ws/src/iros_tool_recognition/models/best_fixed.pt',
                 "image_topic": "/image_rect",
             },
         ],
