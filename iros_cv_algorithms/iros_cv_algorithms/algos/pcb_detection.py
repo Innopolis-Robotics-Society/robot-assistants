@@ -6,7 +6,7 @@ import math
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .interface import CvAlgorithm
 
@@ -106,7 +106,7 @@ class PCBDetectionAlgorithm(CvAlgorithm):
             return {
                 "baseline_set": self._baseline_sig is not None,
                 "calibrating": False,
-                "match": self._baseline_sig is None,  # если эталон ещё не строили — мы "в режиме эталона"
+                "match": self._baseline_sig is None,
                 "ok": False,
                 "reason": "anchor_missing",
                 "anchor_class": self._anchor_class,
@@ -175,7 +175,6 @@ class PCBDetectionAlgorithm(CvAlgorithm):
     # ---------------- anchor + normalization ----------------
 
     def _select_anchor(self, feats: List[_Feat]) -> Optional[_Feat]:
-        """Выбираем якорь: среди anchor_class берём самый уверенный (или largest area при равенстве)."""
         if not feats:
             return None
         cand = [f for f in feats if f.cls == self._anchor_class]
@@ -184,14 +183,6 @@ class PCBDetectionAlgorithm(CvAlgorithm):
         return max(cand, key=lambda f: (f.conf, f.w * f.h))
 
     def _normalize_relative_to_anchor(self, feats: List[_Feat], anchor: Optional[_Feat]) -> List[_Feat]:
-        """
-        Делает координаты и размеры относительными:
-          x' = x - ax
-          y' = y - ay
-          w' = w / aw
-          h' = h / ah
-        Если anchor None — возвращаем как есть (для require_anchor=False).
-        """
         if anchor is None:
             return feats
         aw = max(anchor.w, 1e-6)

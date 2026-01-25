@@ -40,7 +40,7 @@ The main entrypoint launches a complete stack for the default demo scenario (pic
   - `launch/detect_apriltags.launch.py` — namespaced pipeline per camera
   - `config/apriltag.yaml` — tag ids/frames/sizes and detector settings
 
-- **`iros_cv`**  
+- **`iros_tool_recognition`**  
   YOLO-based object localization node(s):
   - `ins_search.py` — detects an object, publishes debug image + target TF/Point
   - model stored in `models/`
