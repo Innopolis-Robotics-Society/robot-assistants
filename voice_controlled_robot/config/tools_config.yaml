@@ -11,8 +11,11 @@ intents:
     phrases: ['stop', 'cancel', 'abort']
   help:
     phrases: ['help', 'commands']
+  inspect:
+    phrases: ["inspection", "check", "inspect"]
 
 tools:
+  # inspect: ["inspection", "check", "inspect"]
   hammer: ['hammer', 'mallet', 'sledgehammer']
   screwdriver: ['screwdriver', 'driver']
   wrench: ['wrench', 'spanner']

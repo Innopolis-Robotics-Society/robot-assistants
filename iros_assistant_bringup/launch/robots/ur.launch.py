@@ -50,12 +50,30 @@ def _launch_setup(context, *args, **kwargs):
         ],
     )
 
+
+    move_tools = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            [
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("iros_assistant_bringup"),
+                        "launch",
+                        "tools",
+                        "move_tools.launch.py",
+                    ]
+                )
+            ]
+        ),
+        launch_arguments=[],
+    )
+
     actions = [
         LogInfo(
             msg=f"[iros_assistant_bringup] UR bringup: ur_type={ur_type}, ip={robot_ip}, "
                 f"ns={'/' + namespace if namespace else '(none)'}, moveit={with_moveit}"
         ),
         ur_control_launch,
+        move_tools,
     ]
 
     if with_moveit:
@@ -74,6 +92,7 @@ def _launch_setup(context, *args, **kwargs):
         return [GroupAction([PushRosNamespace(namespace), *actions])]
 
     return actions
+
 
 
 def generate_launch_description():
