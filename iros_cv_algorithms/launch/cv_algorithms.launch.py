@@ -10,7 +10,6 @@ def generate_launch_description():
     image_topic = LaunchConfiguration("image_topic")
     image_timeout_s = LaunchConfiguration("image_timeout_s")
     result_prefix = LaunchConfiguration("result_prefix")
-    trigger_topic = LaunchConfiguration("trigger_topic")
     trigger_service = LaunchConfiguration("trigger_service")
     process_period_s = LaunchConfiguration("process_period_s")
 
@@ -21,7 +20,6 @@ def generate_launch_description():
         {"image_topic": image_topic},
         {"image_timeout_s": image_timeout_s},
         {"result_prefix": result_prefix},
-        {"trigger_topic": trigger_topic},
         {"trigger_service": trigger_service},
     ]
 
@@ -54,7 +52,6 @@ def generate_launch_description():
         DeclareLaunchArgument("image_topic", default_value="/rgb/image_raw"),
         DeclareLaunchArgument("image_timeout_s", default_value="2.0"),
         DeclareLaunchArgument("result_prefix", default_value="/cv_algorithms/result"),
-        DeclareLaunchArgument("trigger_topic", default_value="/cv_algorithms/run"),
         DeclareLaunchArgument("trigger_service", default_value="/cv_algorithms/run"),
         DeclareLaunchArgument("process_period_s", default_value="2.0"),
 

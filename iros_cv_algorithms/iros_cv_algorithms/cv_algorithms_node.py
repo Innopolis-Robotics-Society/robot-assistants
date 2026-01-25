@@ -14,7 +14,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, String
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from cv_bridge import CvBridge
@@ -30,7 +30,6 @@ class CvAlgorithmsNode(Node):
         self.declare_parameter("image_topic", "/image")
         self.declare_parameter("image_timeout_s", 0.5)
 
-        self.declare_parameter("trigger_topic", "/cv_algorithms/run")
         self.declare_parameter("trigger_service", "/cv_algorithms/run")
 
         self.declare_parameter("result_prefix", "/cv_algorithms/result")
@@ -44,12 +43,11 @@ class CvAlgorithmsNode(Node):
 
         # debug saving for pcb baseline
         self.declare_parameter("save_pcb_baseline_debug", True)
-        self.declare_parameter("debug_images_dir", "src/iros_cv_algorithms/debug_images")
+        self.declare_parameter("debug_images_dir", "/tmp//iros_cv_algorithms/debug_images")
 
         # read params
         self._image_topic = self.get_parameter("image_topic").value
         self._image_timeout_s = float(self.get_parameter("image_timeout_s").value)
-        self._trigger_topic = self.get_parameter("trigger_topic").value
         self._trigger_service = self.get_parameter("trigger_service").value
         self._result_prefix = self.get_parameter("result_prefix").value
 
@@ -68,14 +66,12 @@ class CvAlgorithmsNode(Node):
 
         # triggers / timer
         if self._mode == "trigger":
-            self.create_subscription(Bool, self._trigger_topic, self._on_trigger_topic, 10)
             self.create_service(Trigger, self._trigger_service, self._on_trigger_service)
         elif self._mode == "timer":
             self._timer = self.create_timer(self._process_period_s, self._on_timer)
         else:
             self.get_logger().warn(f"Unknown mode '{self._mode}', fallback to trigger")
             self._mode = "trigger"
-            self.create_subscription(Bool, self._trigger_topic, self._on_trigger_topic, 10)
             self.create_service(Trigger, self._trigger_service, self._on_trigger_service)
 
         # algorithms
@@ -107,15 +103,10 @@ class CvAlgorithmsNode(Node):
 
         self.get_logger().info(
             f"Ready. mode={self._mode}, image_topic={self._image_topic}, timeout={self._image_timeout_s}s, "
-            f"trigger_topic={self._trigger_topic}, trigger_service={self._trigger_service}, "
-            f"result_prefix={self._result_prefix}"
+            f"trigger_service={self._trigger_service}, result_prefix={self._result_prefix}"
         )
         if self._save_pcb_baseline_debug:
             self.get_logger().info(f"PCB baseline debug dir: {self._debug_images_dir}")
-
-    def _on_trigger_topic(self, msg: Bool):
-        if msg.data:
-            self._start_processing()
 
     def _on_timer(self):
         self._start_processing()

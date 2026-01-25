@@ -15,7 +15,7 @@ rc_robot_driver:
     # TCP offset: static transform flange_link -> tool0
     # (X,Y,Z in meters; R,P,Y in degrees)
     flange_to_tool_xyz: [0.0, 0.0, 0.0]
-    flange_to_tool_rpy_deg: [0.0, 180.0, 45.0]
+    flange_to_tool_rpy_deg: [90.0, 90.0, 135.0]
     tool_offset_units: "deg"
     set_tcp_on_start: true
 

@@ -1,0 +1,117 @@
+routines:
+  inspect:
+    steps:
+      # 1) позиция для инспекции
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request:
+          frame: pose_up
+
+      # 2) запуск CV
+      - type: service
+        service_name: /cv_algorithms/run
+        service_type: std_srvs/srv/Trigger
+        request: {}
+
+      # 3) ждём итог CV (true/false)
+      - type: wait_topic
+        topic_name: /cv_algorithms/result/summary
+        topic_type: std_msgs/msg/Bool
+        store_as: cv_ok
+        timeout_sec: 15.0
+
+      # 3.5) открыть захват
+      - type: service
+        service_name: /gripper_action
+        service_type: iros_custom_msgs/srv/GripperAction
+        request:
+          open: true
+
+      # 4) подойти к точке захвата
+
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request:
+          frame: pose_pick_up
+
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request:
+          frame: pose_pick
+
+      # 5) закрыть захват
+
+      - type: service
+        service_name: /gripper_action
+        service_type: iros_custom_msgs/srv/GripperAction
+        request:
+          open: false
+
+      - type: sleep
+        duration_sec: 0.5
+
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request:
+          frame: pose_pick_up
+
+      # 6) развилка по результату CV
+      - type: branch
+        var: cv_ok
+        cases:
+          true:
+            - type: service
+              service_name: /go_to_frame
+              service_type: iros_custom_msgs/srv/GoToFrame
+              request:
+                frame: pose_drop_ok_up
+            - type: service
+              service_name: /go_to_frame
+              service_type: iros_custom_msgs/srv/GoToFrame
+              request:
+                frame: pose_drop_ok
+            # 7) открыть захват (отпустить предмет)
+            - type: service
+              service_name: /gripper_action
+              service_type: iros_custom_msgs/srv/GripperAction
+              request:
+                open: true
+
+            - type: sleep
+              duration_sec: 0.5
+
+            - type: service
+              service_name: /go_to_frame
+              service_type: iros_custom_msgs/srv/GoToFrame
+              request:
+                frame: pose_drop_ok_up
+          false:
+            - type: service
+              service_name: /go_to_frame
+              service_type: iros_custom_msgs/srv/GoToFrame
+              request:
+                frame: pose_drop_nok_up
+            - type: service
+              service_name: /go_to_frame
+              service_type: iros_custom_msgs/srv/GoToFrame
+              request:
+                frame: pose_drop_nok
+            # 7) открыть захват (отпустить предмет)
+            - type: service
+              service_name: /gripper_action
+              service_type: iros_custom_msgs/srv/GripperAction
+              request:
+                open: true
+
+            - type: sleep
+              duration_sec: 0.5
+
+            - type: service
+              service_name: /go_to_frame
+              service_type: iros_custom_msgs/srv/GoToFrame
+              request:
+                frame: pose_drop_nok_up

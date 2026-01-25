@@ -86,14 +86,14 @@ class VoiceController(Node):
         if status:
             self.get_logger().warn(f'Audio callback status: {status}')
         self.audio_queue.put(bytes(indata))
-        self.get_logger().info(f'Audio callback received {frames} frames')
+        #self.get_logger().info(f'Audio callback received {frames} frames')
 
     def process_audio(self):
         while not self.audio_queue.empty():
             data = self.audio_queue.get()
 
             # Логирование размера полученных данных
-            self.get_logger().info(f'Processing audio data: {len(data)} bytes')
+            #self.get_logger().info(f'Processing audio data: {len(data)} bytes')
 
             if self.recognizer.AcceptWaveform(data):
                 result = json.loads(self.recognizer.Result())

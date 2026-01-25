@@ -170,10 +170,15 @@ USER $USERNAME
 
 RUN mkdir -p /home/$USERNAME/ros2_ws/src
 
+
 COPY extras/python_api_1.4.1.zip /tmp/python_api_1.4.1.zip
 RUN pip3 install /tmp/python_api_1.4.1.zip && \
     sudo rm /tmp/python_api_1.4.1.zip
 
+# Extra python libs
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+ && python3 -m pip install --no-cache-dir \ 
+    rapidfuzz
 
 CMD ["bash"]
 #docker build -t image_name -f Dockerfile .
