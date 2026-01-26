@@ -27,6 +27,8 @@ setup(
     entry_points={
         'console_scripts': [
             'cv_algorithms_node = iros_cv_algorithms.cv_algorithms_node:main',
+            'pcb_check = iros_cv_algorithms.pcb_check:main',
+
         ],
     },
 )

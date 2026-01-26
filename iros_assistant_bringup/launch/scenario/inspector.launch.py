@@ -104,19 +104,26 @@ def generate_launch_description():
             ]
         ),
         launch_arguments={
-            "depth_enabled": "true",
+            # только RGB
             "color_enabled": "true",
-            "point_cloud": "true",
-            "rgb_point_cloud": "true",
+            "color_resolution": "3072P",   # максимум деталей (4096x3072)
+            "color_format": "bgra",        # без JPEG-артефактов (тяжелее по CPU/USB)
+            "fps": "15",                   # 3072P не бывает 30 FPS
+
+            # всё остальное выключаем
+            "depth_enabled": "false",
+            "point_cloud": "false",
+            "rgb_point_cloud": "false",
             "point_cloud_in_depth_frame": "false",
-            "depth_mode": "WFOV_UNBINNED",
-            "fps": "15",
-            "depth_unit": "32FC1",
-            "color_resolution": "1080P",
-            "color_format": "bgra",
-            "imu_rate_target": "100",
+
+            # лишние сенсоры/фичи
+            "imu_rate_target": "0",
             "wired_sync_mode": "0",
+            "body_tracking_enabled": "false",
             "body_tracking_smoothing_factor": "0.0",
+
+            # на всякий случай
+            "rescale_ir_to_mono8": "false",
         }.items(),
     )
 
@@ -143,7 +150,7 @@ def generate_launch_description():
     )
 
     voice_rec = Node(
-        package="voice_controlled_robot",
+        package="iros_voice_controlled_robot",
         executable="voice_controller",
         #arguments=["-d", rviz_cfg],
     )
@@ -175,9 +182,9 @@ def generate_launch_description():
             robot_ip_arg,
             tf,
             ur_launch,
-            robopro_launch,
+            #robopro_launch,
             azure_driver,
-            cv_pipeline,
+            #cv_pipeline,
             voice_rec,
             behavior,
             rviz,
