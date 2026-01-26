@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROS2 PCB Inspector Node (standalone) with red-anchor ROI
+ROS2 PCB Inspector Node (standalone) with robust red-anchor ROI
 
-- Anchors: 4 red spots at rectangle corners (on PCB fixture/board).
-- ROI: model runs ONLY inside the polygon defined by these 4 anchors (masking),
-       so outside detections are suppressed.
-- Important: there may be a red LED; anchor detection is hardened by:
-  * area filtering (min/max pixel area),
-  * taking ONLY extreme points (corners) among candidates.
+What changed vs previous version:
+- ROI detection made more robust:
+  1) Red mask = HSV red OR "redness score" (R - max(G,B)) threshold.
+  2) Candidate filtering by area + circularity + aspect ratio.
+  3) Corner selection via minAreaRect on candidate centers, then snapping each corner
+     to the nearest unused candidate (prevents picking the red LED inside the rectangle).
+  4) Stronger validation: min pairwise separation, max corner snap distance, ROI size sanity.
 
-Topics:
-  Sub:  /rgb/image_raw (sensor_msgs/Image)  [param image_topic]
-  Pub:  ~/annotated    (sensor_msgs/Image)
-        ~/report       (std_msgs/String) JSON
-
-Services:
-  ~/calibration (std_srvs/Trigger)
-  ~/inference   (std_srvs/Trigger)
-  ~/reset       (std_srvs/Trigger)
-
-Dependencies:
-  - rclpy, cv_bridge, opencv-python
-  - ultralytics (YOLO)
+If ROI isn't found, check the published ~/annotated image (draw_roi_debug=True) and tune:
+- anchor_s_min, anchor_v_min
+- anchor_redness_thr, anchor_min_area_px
+- anchor_near_corner_max_px, anchor_min_sep_px
 """
 
 from __future__ import annotations
@@ -37,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+import math
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -163,10 +156,10 @@ class PCBInspectorNode(Node):
         self._bridge = CvBridge()
 
         # Parameters
-        self.declare_parameter("image_topic", "/cam/front/image_raw")
+        self.declare_parameter("image_topic", "/image_raw")
 
         # YOLO
-        self.declare_parameter("model_path", "/home/mobile/ros2_ws/src/iros_cv_algorithms/iros_cv_algorithms/algos/models/yolo12s-pcb.pt")
+        self.declare_parameter("model_path", "/home/mobile/ros2_ws/src/iros_cv_algorithms/iros_cv_algorithms/algos/models/yolo11s_best.pt")
         self.declare_parameter("conf_thr", 0.25)
         self.declare_parameter("iou_thr", 0.50)
         self.declare_parameter("device", "0")
@@ -188,12 +181,31 @@ class PCBInspectorNode(Node):
         # Frame wait
         self.declare_parameter("frame_wait_timeout_sec", 2.0)
 
-        # Anchor (red) detection params
-        self.declare_parameter("anchor_min_area_px", 250)     # increase if LED is selected
-        self.declare_parameter("anchor_max_area_px", 50000)
-        self.declare_parameter("anchor_topk", 12)             # keep top-K by area for corner selection
-        self.declare_parameter("roi_margin_px", 20)            # expand ROI bbox (safety margin)
-        self.declare_parameter("roi_min_area_frac", 0.05)     # minimal ROI bbox area vs image area
+        # Anchor/ROI detection params (tune these first)
+        self.declare_parameter("anchor_min_area_px", 150)      # if too high -> not_enough_red_blobs
+        self.declare_parameter("anchor_max_area_px", 200000)
+        self.declare_parameter("anchor_circularity_min", 0.25) # lower if anchors are not circular
+        self.declare_parameter("anchor_aspect_max", 2.0)
+        self.declare_parameter("anchor_topk", 20)
+
+        # HSV thresholds
+        self.declare_parameter("anchor_h_lo1", 0)
+        self.declare_parameter("anchor_h_hi1", 25)
+        self.declare_parameter("anchor_h_lo2", 160)
+        self.declare_parameter("anchor_h_hi2", 179)
+        self.declare_parameter("anchor_s_min", 60)
+        self.declare_parameter("anchor_v_min", 40)
+
+        # Redness score thresholds (BGR)
+        self.declare_parameter("anchor_redness_thr", 50)  # threshold on (R - max(G,B))
+        self.declare_parameter("anchor_r_min", 60)        # minimal R channel
+
+        # Geometry validation
+        self.declare_parameter("anchor_min_sep_px", 25)         # min distance between chosen corners
+        self.declare_parameter("anchor_near_corner_max_px", 80) # max distance to snap rect corner to candidate
+        self.declare_parameter("roi_margin_px", 10)
+        self.declare_parameter("roi_min_area_frac", 0.05)
+
         self.declare_parameter("draw_roi_debug", True)
 
         # Topics
@@ -217,7 +229,7 @@ class PCBInspectorNode(Node):
         self._busy_lock = threading.Lock()
         self._busy: bool = False
 
-        # Baseline state (in ROI coordinate system: xywh normalized to ROI crop)
+        # Baseline state (ROI-normalized)
         self._base_lock = threading.Lock()
         self._baseline: Optional[Dict[str, List[BaselineEntry]]] = None
         self._baseline_counts: Optional[Dict[str, int]] = None
@@ -357,7 +369,6 @@ class PCBInspectorNode(Node):
                     self._img_cond.wait(timeout=0.05)
                 if self._img_cv is None:
                     return []
-
             last_stamp = self._img_stamp_ns
             out.append(self._img_cv.copy())
 
@@ -373,43 +384,73 @@ class PCBInspectorNode(Node):
                     break
         return out
 
-    # ------------------------- anchor ROI detection -------------------------
+    # ------------------------- anchor ROI detection (robust) -------------------------
 
     def _detect_roi(self, image_bgr: np.ndarray) -> Tuple[Optional[ROI], Dict[str, Any]]:
-        """
-        Detect 4 red anchors and build ROI polygon + bbox crop.
-        Returns (roi, debug_dict).
-        """
         H, W = image_bgr.shape[:2]
-        dbg: Dict[str, Any] = {"anchors_found": 0}
+        dbg: Dict[str, Any] = {}
 
+        # ---- Build red mask: HSV OR redness score ----
         hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 
-        # Typical red ranges in HSV (OpenCV H: 0..179)
-        lower1 = np.array([0, 120, 70], dtype=np.uint8)
-        upper1 = np.array([10, 255, 255], dtype=np.uint8)
-        lower2 = np.array([170, 120, 70], dtype=np.uint8)
-        upper2 = np.array([179, 255, 255], dtype=np.uint8)
+        h_lo1 = int(self.get_parameter("anchor_h_lo1").value)
+        h_hi1 = int(self.get_parameter("anchor_h_hi1").value)
+        h_lo2 = int(self.get_parameter("anchor_h_lo2").value)
+        h_hi2 = int(self.get_parameter("anchor_h_hi2").value)
+        s_min = int(self.get_parameter("anchor_s_min").value)
+        v_min = int(self.get_parameter("anchor_v_min").value)
 
-        mask1 = cv2.inRange(hsv, lower1, upper1)
-        mask2 = cv2.inRange(hsv, lower2, upper2)
-        mask = cv2.bitwise_or(mask1, mask2)
+        lower1 = np.array([h_lo1, s_min, v_min], dtype=np.uint8)
+        upper1 = np.array([h_hi1, 255, 255], dtype=np.uint8)
+        lower2 = np.array([h_lo2, s_min, v_min], dtype=np.uint8)
+        upper2 = np.array([h_hi2, 255, 255], dtype=np.uint8)
 
-        # Morphology to merge blobs and suppress noise (LED often small -> removed by area filter too)
+        mask_hsv = cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
+
+        b, g, r = cv2.split(image_bgr)
+        redness_thr = int(self.get_parameter("anchor_redness_thr").value)
+        r_min = int(self.get_parameter("anchor_r_min").value)
+        redness = cv2.subtract(r, cv2.max(b, g))  # uint8, saturates at 0
+        mask_redness = cv2.inRange(redness, redness_thr, 255)
+        mask_rmin = cv2.inRange(r, r_min, 255)
+        mask_bgr = cv2.bitwise_and(mask_redness, mask_rmin)
+
+        mask = cv2.bitwise_or(mask_hsv, mask_bgr)
+
+        # ---- Morphology ----
+        mask = cv2.GaussianBlur(mask, (5, 5), 0)
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
 
+        # ---- Contours -> candidates ----
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         min_a = int(self.get_parameter("anchor_min_area_px").value)
         max_a = int(self.get_parameter("anchor_max_area_px").value)
-        candidates: List[Tuple[float, float, float]] = []  # (cx, cy, area)
+        circ_min = float(self.get_parameter("anchor_circularity_min").value)
+        asp_max = float(self.get_parameter("anchor_aspect_max").value)
+        topk = int(self.get_parameter("anchor_topk").value)
 
+        candidates: List[Tuple[float, float, float]] = []  # (cx, cy, area)
         for c in contours:
             area = float(cv2.contourArea(c))
             if area < min_a or area > max_a:
                 continue
+
+            per = float(cv2.arcLength(c, True))
+            if per <= 1e-6:
+                continue
+            circularity = float(4.0 * np.pi * area / (per * per))
+
+            x, y, ww, hh = cv2.boundingRect(c)
+            aspect = float(max(ww, hh) / max(min(ww, hh), 1))
+
+            if circularity < circ_min:
+                continue
+            if aspect > asp_max:
+                continue
+
             M = cv2.moments(c)
             if abs(M.get("m00", 0.0)) < 1e-6:
                 continue
@@ -417,37 +458,57 @@ class PCBInspectorNode(Node):
             cy = float(M["m01"] / M["m00"])
             candidates.append((cx, cy, area))
 
-        dbg["anchors_found"] = len(candidates)
+        candidates.sort(key=lambda t: t[2], reverse=True)
+        candidates = candidates[:max(4, topk)]
+
+        dbg["anchors_candidates"] = len(candidates)
+        dbg["cand_pts"] = [[float(c[0]), float(c[1]), float(c[2])] for c in candidates[:30]]
 
         if len(candidates) < 4:
             dbg["reason"] = "not_enough_red_blobs"
             return None, dbg
 
-        # keep top-K by area; corners should be among the biggest spots
-        topk = int(self.get_parameter("anchor_topk").value)
-        candidates.sort(key=lambda t: t[2], reverse=True)
-        candidates = candidates[:max(4, topk)]
-
         pts = np.array([[c[0], c[1]] for c in candidates], dtype=np.float32)
 
-        # choose extremes as corners (this avoids selecting an internal LED)
-        s = pts[:, 0] + pts[:, 1]
-        d = pts[:, 0] - pts[:, 1]
-        tl = pts[int(np.argmin(s))]
-        br = pts[int(np.argmax(s))]
-        tr = pts[int(np.argmax(d))]
-        bl = pts[int(np.argmin(d))]
+        # ---- Corner selection via minAreaRect + snap to nearest candidates ----
+        rect = cv2.minAreaRect(pts.reshape(-1, 1, 2))
+        box = cv2.boxPoints(rect).astype(np.float32)  # 4 corners of fitted rectangle
+        box = _order_quad_points(box)
 
-        quad = np.stack([tl, tr, br, bl], axis=0).astype(np.float32)
-        quad = _order_quad_points(quad)
+        snap_max = float(self.get_parameter("anchor_near_corner_max_px").value)
+        chosen: List[np.ndarray] = []
+        used = np.zeros((len(pts),), dtype=bool)
 
-        # ensure corners are distinct enough
-        uniq = np.unique(quad.round(decimals=1), axis=0)
-        if uniq.shape[0] < 4:
-            dbg["reason"] = "corner_points_not_distinct"
-            return None, dbg
+        for corner in box:
+            d2 = np.sum((pts - corner[None, :]) ** 2, axis=1)
+            order = np.argsort(d2)
+            sel = None
+            for idx in order:
+                if used[idx]:
+                    continue
+                dist = float(math.sqrt(float(d2[idx])))
+                if dist <= snap_max:
+                    sel = idx
+                    break
+            if sel is None:
+                dbg["reason"] = "no_candidate_near_rect_corner"
+                dbg["rect_box"] = box.tolist()
+                return None, dbg
+            used[sel] = True
+            chosen.append(pts[sel])
 
-        # bbox crop around quad
+        quad = _order_quad_points(np.stack(chosen, axis=0))
+
+        # ---- Validate distinct corners ----
+        min_sep = float(self.get_parameter("anchor_min_sep_px").value)
+        for i in range(4):
+            for j in range(i + 1, 4):
+                if float(np.linalg.norm(quad[i] - quad[j])) < min_sep:
+                    dbg["reason"] = "corner_points_not_distinct"
+                    dbg["roi_quad"] = quad.tolist()
+                    return None, dbg
+
+        # ---- BBox ROI around quad ----
         x_min = int(np.floor(np.min(quad[:, 0])))
         y_min = int(np.floor(np.min(quad[:, 1])))
         x_max = int(np.ceil(np.max(quad[:, 0])))
@@ -462,25 +523,22 @@ class PCBInspectorNode(Node):
         roi_w = max(1, x_max - x_min + 1)
         roi_h = max(1, y_max - y_min + 1)
 
-        # sanity: ROI must be large enough (avoid accidental small rect around LED)
         min_frac = float(self.get_parameter("roi_min_area_frac").value)
         if (roi_w * roi_h) < (min_frac * W * H):
             dbg["reason"] = "roi_too_small_probably_false_anchor"
             dbg["roi_bbox"] = [x_min, y_min, roi_w, roi_h]
+            dbg["roi_quad"] = quad.tolist()
             return None, dbg
 
         roi = ROI(x0=x_min, y0=y_min, w=roi_w, h=roi_h, quad=quad)
         dbg["roi_bbox"] = [roi.x0, roi.y0, roi.w, roi.h]
         dbg["roi_quad"] = quad.tolist()
+        dbg["reason"] = "ok"
         return roi, dbg
 
     def _crop_and_mask_roi(self, image_bgr: np.ndarray, roi: ROI) -> np.ndarray:
-        """
-        Crop axis-aligned bbox and zero everything outside quad polygon inside the crop.
-        """
         crop = image_bgr[roi.y0:roi.y0 + roi.h, roi.x0:roi.x0 + roi.w].copy()
 
-        # polygon in crop coordinates
         poly = roi.quad.copy()
         poly[:, 0] -= float(roi.x0)
         poly[:, 1] -= float(roi.y0)
@@ -489,8 +547,7 @@ class PCBInspectorNode(Node):
         mask = np.zeros((roi.h, roi.w), dtype=np.uint8)
         cv2.fillPoly(mask, [poly_i], 255)
 
-        crop_masked = cv2.bitwise_and(crop, crop, mask=mask)
-        return crop_masked
+        return cv2.bitwise_and(crop, crop, mask=mask)
 
     # ------------------------- YOLO inference within ROI -------------------------
 
@@ -533,7 +590,7 @@ class PCBInspectorNode(Node):
     def _counts(self, sig: Dict[str, List[Det]]) -> Dict[str, int]:
         return {k: len(v) for k, v in sig.items()}
 
-    # ------------------------- baseline -------------------------
+    # ------------------------- baseline helpers -------------------------
 
     def _baseline_is_set(self) -> bool:
         with self._base_lock:
@@ -543,7 +600,6 @@ class PCBInspectorNode(Node):
         min_pos_tol = float(self.get_parameter("min_pos_tol").value)
         min_size_tol = float(self.get_parameter("min_size_tol").value)
         min_iou = float(self.get_parameter("min_iou").value)
-
         pos_margin = float(self.get_parameter("pos_margin").value)
         size_margin = float(self.get_parameter("size_margin").value)
         iou_margin = float(self.get_parameter("iou_margin").value)
@@ -579,6 +635,26 @@ class PCBInspectorNode(Node):
             out[cls] = [Det(cls=d.cls, x=d.x - tx, y=d.y - ty, w=d.w, h=d.h, conf=d.conf) for d in lst]
         return out
 
+    def _estimate_translation_from_baseline(self, sig: Dict[str, List[Det]]) -> Tuple[float, float]:
+        with self._base_lock:
+            baseline = self._baseline
+            base_counts = self._baseline_counts
+        if baseline is None or base_counts is None:
+            return 0.0, 0.0
+        cur_counts = self._counts(sig)
+        if cur_counts != base_counts:
+            return 0.0, 0.0
+        dxs: List[float] = []
+        dys: List[float] = []
+        for cls, entries in baseline.items():
+            cur_list = sig.get(cls, [])
+            for i, be in enumerate(entries):
+                if i >= len(cur_list):
+                    continue
+                dxs.append(cur_list[i].x - be.mean.x)
+                dys.append(cur_list[i].y - be.mean.y)
+        return _median(dxs), _median(dys)
+
     # ------------------------- calibration (build/update) -------------------------
 
     def _calibration_build(self, frames: List[np.ndarray]) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
@@ -586,51 +662,44 @@ class PCBInspectorNode(Node):
 
         sigs: List[Dict[str, List[Det]]] = []
         counts_list: List[Dict[str, int]] = []
-        rois: List[Optional[ROI]] = []
-        dbg_list: List[Dict[str, Any]] = []
-
+        rois_ok: List[bool] = []
+        dbg_last: Dict[str, Any] = {}
         last_annot: Optional[np.ndarray] = None
 
         for i, img in enumerate(frames, start=1):
             roi, dbg = self._detect_roi(img)
-            rois.append(roi)
-            dbg_list.append(dbg)
-
+            dbg_last = dbg
             if roi is None:
                 self.get_logger().info(f"calibration(build): frame {i}/{len(frames)} ROI not found ({dbg.get('reason')})")
                 sigs.append({})
                 counts_list.append({})
+                rois_ok.append(False)
                 last_annot = self._draw_roi_debug(img, roi=None, dbg=dbg)
                 continue
 
             dets = self._infer_in_roi(img, roi)
             sig = self._signature(dets)
-            sigs.append(sig)
             counts = self._counts(sig)
+            sigs.append(sig)
             counts_list.append(counts)
+            rois_ok.append(True)
 
             self.get_logger().info(f"calibration(build): frame {i}/{len(frames)} counts={counts}")
-            last_annot = self._draw_overlay(img, roi, sig, None, None, [], [], [])
+            last_annot = self._draw_overlay(img, roi, sig, baseline=None, base_counts=None,
+                                           mismatches=[], missing=[], extra=[], tx=0.0, ty=0.0, roi_dbg=dbg)
 
-        # choose mode counts among frames with ROI
         def key_of(c: Dict[str, int]) -> Tuple[Tuple[str, int], ...]:
             return tuple(sorted(c.items()))
 
+        idx_valid = [i for i, ok in enumerate(rois_ok) if ok]
+        if not idx_valid:
+            report = {"command": "calibration", "baseline_set": False, "overall_ok": False, "reason": "roi_not_found_all_frames", "roi_debug_last": dbg_last}
+            return False, report, last_annot
+
         freq: Dict[Tuple[Tuple[str, int], ...], int] = {}
-        idx_valid = [i for i, r in enumerate(rois) if r is not None]
         for i in idx_valid:
             k = key_of(counts_list[i])
             freq[k] = freq.get(k, 0) + 1
-
-        if not freq:
-            report = {
-                "command": "calibration",
-                "baseline_set": False,
-                "overall_ok": False,
-                "reason": "roi_not_found_all_frames",
-                "roi_debug_last": dbg_list[-1] if dbg_list else {},
-            }
-            return False, report, last_annot
 
         mode_key = max(freq.items(), key=lambda kv: kv[1])[0]
         base_counts = dict(mode_key)
@@ -645,21 +714,18 @@ class PCBInspectorNode(Node):
                 "mode_counts": base_counts,
                 "mode_have": len(good_idx),
                 "need_at_least": 2,
-                "roi_debug_last": dbg_list[-1] if dbg_list else {},
+                "roi_debug_last": dbg_last,
             }
             return False, report, last_annot
 
-        # align good sigs to the first good sig (ROI-normalized, so this is mostly for jitter)
         ref_sig = sigs[good_idx[0]]
         aligned_sigs: List[Dict[str, List[Det]]] = []
         for j, idx in enumerate(good_idx, start=1):
             cur_sig = sigs[idx]
             tx, ty = self._estimate_translation_between(ref_sig, cur_sig, base_counts)
-            aligned = self._apply_translation(cur_sig, tx, ty)
-            aligned_sigs.append(aligned)
+            aligned_sigs.append(self._apply_translation(cur_sig, tx, ty))
             self.get_logger().info(f"calibration(build): align {j}/{len(good_idx)} tx={tx:.6f} ty={ty:.6f}")
 
-        # build baseline mean
         baseline: Dict[str, List[BaselineEntry]] = {}
         for cls, cnt in base_counts.items():
             if cnt <= 0:
@@ -668,7 +734,6 @@ class PCBInspectorNode(Node):
             ys = np.zeros((len(aligned_sigs), cnt), dtype=np.float64)
             ws = np.zeros((len(aligned_sigs), cnt), dtype=np.float64)
             hs = np.zeros((len(aligned_sigs), cnt), dtype=np.float64)
-
             for si, sig in enumerate(aligned_sigs):
                 lst = sig.get(cls, [])
                 for k in range(cnt):
@@ -677,12 +742,10 @@ class PCBInspectorNode(Node):
                     ys[si, k] = d.y
                     ws[si, k] = d.w
                     hs[si, k] = d.h
-
             mean_x = xs.mean(axis=0)
             mean_y = ys.mean(axis=0)
             mean_w = ws.mean(axis=0)
             mean_h = hs.mean(axis=0)
-
             entries: List[BaselineEntry] = []
             for k in range(cnt):
                 be = BaselineEntry(mean=BoxMean(float(mean_x[k]), float(mean_y[k]), float(mean_w[k]), float(mean_h[k])))
@@ -690,7 +753,6 @@ class PCBInspectorNode(Node):
                 entries.append(be)
             baseline[cls] = entries
 
-        # compute worst deviations + min IoU
         for sig in aligned_sigs:
             for cls, entries in baseline.items():
                 cur_list = sig.get(cls, [])
@@ -701,14 +763,13 @@ class PCBInspectorNode(Node):
                     dw = _rel_diff(be.mean.w, d.w)
                     dh = _rel_diff(be.mean.h, d.h)
                     iou = _iou_xywh((be.mean.x, be.mean.y, be.mean.w, be.mean.h), (d.x, d.y, d.w, d.h))
-
                     be.max_dx = max(be.max_dx, dx)
                     be.max_dy = max(be.max_dy, dy)
                     be.max_dw_rel = max(be.max_dw_rel, dw)
                     be.max_dh_rel = max(be.max_dh_rel, dh)
                     be.min_iou = min(be.min_iou, iou)
 
-        for cls, entries in baseline.items():
+        for entries in baseline.values():
             for be in entries:
                 self._compute_tolerances(be)
 
@@ -725,24 +786,7 @@ class PCBInspectorNode(Node):
             "accepted_frames": len(good_idx),
             "total_frames": len(frames),
         }
-
-        # annotate last frame (if it had ROI)
-        last_img = frames[-1]
-        last_roi, last_dbg = self._detect_roi(last_img)
-        if last_roi is None:
-            annot = self._draw_roi_debug(last_img, roi=None, dbg=last_dbg)
-            report["overall_ok"] = False
-            report["reason"] = "baseline_created_but_roi_missing_on_last_frame"
-            report["roi_debug_last"] = last_dbg
-            return True, report, annot
-
-        last_sig = self._signature(self._infer_in_roi(last_img, last_roi))
-        ok, details, annot = self._check_and_annotate(last_img, last_roi, last_sig, command="calibration")
-        report.update(details)
-        report["overall_ok"] = bool(ok)
-        if not ok:
-            report["reason"] = details.get("reason", "baseline_created_check_failed")
-        return True, report, annot
+        return True, report, last_annot
 
     def _calibration_update(self, frames: List[np.ndarray]) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
         self.get_logger().info(f"calibration(update): frames={len(frames)}")
@@ -771,18 +815,17 @@ class PCBInspectorNode(Node):
             if cur_counts != base_counts:
                 rejected += 1
                 self.get_logger().info(f"calibration(update): frame {i}/{len(frames)} rejected counts={cur_counts} ref={base_counts}")
-                last_annot = self._draw_overlay(img, roi, sig, None, None, [], [], [])
+                last_annot = self._draw_overlay(img, roi, sig, baseline=None, base_counts=base_counts,
+                                               mismatches=[], missing=[], extra=[], tx=0.0, ty=0.0, roi_dbg=dbg)
                 continue
 
-            # align to baseline mean (ROI coords) via translation for jitter robustness
             tx, ty = self._estimate_translation_from_baseline(sig)
             sig_al = self._apply_translation(sig, tx, ty)
-
             self._update_baseline_with_sample(sig_al)
             accepted += 1
             self.get_logger().info(f"calibration(update): frame {i}/{len(frames)} accepted tx={tx:.6f} ty={ty:.6f}")
 
-            ok, details, annot = self._check_and_annotate(img, roi, sig, command="calibration")
+            ok, details, annot = self._check_and_annotate(img, roi, sig, roi_dbg=dbg)
             last_annot = annot
             last_details = details
 
@@ -801,43 +844,19 @@ class PCBInspectorNode(Node):
         report.update(last_details)
         return ok_final, report, last_annot
 
-    def _estimate_translation_from_baseline(self, sig: Dict[str, List[Det]]) -> Tuple[float, float]:
-        with self._base_lock:
-            baseline = self._baseline
-            base_counts = self._baseline_counts
-        if baseline is None or base_counts is None:
-            return 0.0, 0.0
-        cur_counts = self._counts(sig)
-        if cur_counts != base_counts:
-            return 0.0, 0.0
-
-        dxs: List[float] = []
-        dys: List[float] = []
-        for cls, entries in baseline.items():
-            cur_list = sig.get(cls, [])
-            for i, be in enumerate(entries):
-                if i >= len(cur_list):
-                    continue
-                dxs.append(cur_list[i].x - be.mean.x)
-                dys.append(cur_list[i].y - be.mean.y)
-        return _median(dxs), _median(dys)
-
     def _update_baseline_with_sample(self, sig_aligned: Dict[str, List[Det]]) -> None:
         with self._base_lock:
             if self._baseline is None or self._baseline_counts is None:
                 return
             baseline = self._baseline
             base_counts = self._baseline_counts
-
-            cur_counts = self._counts(sig_aligned)
-            if cur_counts != base_counts:
+            if self._counts(sig_aligned) != base_counts:
                 return
 
             for cls, entries in baseline.items():
                 cur_list = sig_aligned.get(cls, [])
                 for i, be in enumerate(entries):
                     d = cur_list[i]
-
                     dx = abs(d.x - be.mean.x)
                     dy = abs(d.y - be.mean.y)
                     dw = _rel_diff(be.mean.w, d.w)
@@ -850,8 +869,7 @@ class PCBInspectorNode(Node):
                     be.max_dh_rel = max(be.max_dh_rel, dh)
                     be.min_iou = min(be.min_iou, iou)
 
-                    n0 = be.n
-                    n1 = n0 + 1
+                    n1 = be.n + 1
                     be.mean.x = be.mean.x + (d.x - be.mean.x) / n1
                     be.mean.y = be.mean.y + (d.y - be.mean.y) / n1
                     be.mean.w = be.mean.w + (d.w - be.mean.w) / n1
@@ -882,7 +900,7 @@ class PCBInspectorNode(Node):
                 self.get_logger().info(f"inference: frame {i}/{len(frames)} ROI not found ({dbg.get('reason')})")
             else:
                 sig = self._signature(self._infer_in_roi(img, roi))
-                ok, details, annot = self._check_and_annotate(img, roi, sig, command="inference")
+                ok, details, annot = self._check_and_annotate(img, roi, sig, roi_dbg=dbg)
                 per_frame.append({"i": i, "ok": bool(ok), "reason": details.get("reason", "unknown")})
                 self.get_logger().info(f"inference: frame {i}/{len(frames)} ok={ok} reason={details.get('reason')}")
 
@@ -904,19 +922,19 @@ class PCBInspectorNode(Node):
         return overall_ok, report, last_annot
 
     def _check_and_annotate(
-        self, image_bgr: np.ndarray, roi: ROI, sig: Dict[str, List[Det]], command: str
+        self, image_bgr: np.ndarray, roi: ROI, sig: Dict[str, List[Det]], roi_dbg: Dict[str, Any]
     ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
         with self._base_lock:
             baseline = self._baseline
             base_counts = self._baseline_counts
 
         if baseline is None or base_counts is None:
-            annot = self._draw_overlay(image_bgr, roi, sig, None, None, [], [], [])
+            annot = self._draw_overlay(image_bgr, roi, sig, baseline=None, base_counts=None,
+                                      mismatches=[], missing=[], extra=[], tx=0.0, ty=0.0, roi_dbg=roi_dbg)
             return False, {"reason": "baseline_not_set"}, annot
 
         cur_counts = self._counts(sig)
 
-        # translation alignment within ROI coords
         tx, ty = (0.0, 0.0)
         if cur_counts == base_counts:
             tx, ty = self._estimate_translation_from_baseline(sig)
@@ -947,13 +965,11 @@ class PCBInspectorNode(Node):
             reason = "counts_mismatch"
 
         for cls, entries in baseline.items():
-            ref_n = len(entries)
             cur_list = sig_al.get(cls, [])
-            m = min(ref_n, len(cur_list))
+            m = min(len(entries), len(cur_list))
             for i in range(m):
                 be = entries[i]
                 d = cur_list[i]
-
                 dx = abs(d.x - be.mean.x)
                 dy = abs(d.y - be.mean.y)
                 dw_rel = _rel_diff(be.mean.w, d.w)
@@ -986,6 +1002,7 @@ class PCBInspectorNode(Node):
             "tx_ty": {"tx": tx, "ty": ty},
             "roi_bbox": [roi.x0, roi.y0, roi.w, roi.h],
             "roi_quad": roi.quad.tolist(),
+            "roi_debug": roi_dbg,
         }
         if missing:
             details["missing"] = missing
@@ -994,14 +1011,43 @@ class PCBInspectorNode(Node):
         if mismatches:
             details["mismatches"] = mismatches[:50]
 
-        annot = self._draw_overlay(image_bgr, roi, sig, baseline, base_counts, mismatches, missing, extra, tx=tx, ty=ty)
+        annot = self._draw_overlay(image_bgr, roi, sig, baseline=baseline, base_counts=base_counts,
+                                   mismatches=mismatches, missing=missing, extra=extra, tx=tx, ty=ty, roi_dbg=roi_dbg)
         return ok, details, annot
 
     # ------------------------- visualization -------------------------
 
+    def _draw_roi_debug(self, img: np.ndarray, roi: Optional[ROI], dbg: Dict[str, Any]) -> np.ndarray:
+        out = img.copy()
+        if not bool(self.get_parameter("draw_roi_debug").value):
+            return out
+
+        txt = f"ROI: {'OK' if roi is not None else 'FAIL'} reason={dbg.get('reason','')} cand={dbg.get('anchors_candidates',0)}"
+        cv2.putText(out, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # draw candidate centers (magenta)
+        cand = dbg.get("cand_pts", [])
+        for c in cand[:30]:
+            x, y = int(round(c[0])), int(round(c[1]))
+            cv2.circle(out, (x, y), 5, (255, 0, 255), -1)
+
+        bbox = dbg.get("roi_bbox", None)
+        if bbox and isinstance(bbox, list) and len(bbox) == 4:
+            x0, y0, w, h = bbox
+            cv2.rectangle(out, (int(x0), int(y0)), (int(x0 + w), int(y0 + h)), (255, 255, 0), 2)
+
+        quad = dbg.get("roi_quad", None)
+        if quad and isinstance(quad, list) and len(quad) == 4:
+            q = np.array(quad, dtype=np.int32).reshape(4, 2)
+            cv2.polylines(out, [q.reshape(-1, 1, 2)], True, (0, 255, 255), 3)
+            for i, (x, y) in enumerate(q):
+                cv2.circle(out, (int(x), int(y)), 7, (0, 255, 255), -1)
+                cv2.putText(out, f"{i}", (int(x) + 8, int(y) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+        return out
+
     @staticmethod
     def _px_from_roi(det: Det, roi: ROI) -> Tuple[int, int, int, int]:
-        # det is ROI-normalized
         x1, y1, x2, y2 = _xywh_to_xyxy(det.x, det.y, det.w, det.h)
         x1p = int(round(roi.x0 + x1 * roi.w))
         y1p = int(round(roi.y0 + y1 * roi.h))
@@ -1018,31 +1064,6 @@ class PCBInspectorNode(Node):
         y2p = int(round(roi.y0 + y2 * roi.h))
         return x1p, y1p, x2p, y2p
 
-    def _draw_roi_debug(self, img: np.ndarray, roi: Optional[ROI], dbg: Dict[str, Any]) -> np.ndarray:
-        out = img.copy()
-        draw = bool(self.get_parameter("draw_roi_debug").value)
-        if not draw:
-            return out
-
-        H, W = out.shape[:2]
-        txt = f"ROI: {'OK' if roi is not None else 'FAIL'} ({dbg.get('reason','')}) anchors={dbg.get('anchors_found',0)}"
-        cv2.putText(out, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-
-        bbox = dbg.get("roi_bbox", None)
-        if bbox and isinstance(bbox, list) and len(bbox) == 4:
-            x0, y0, w, h = bbox
-            cv2.rectangle(out, (int(x0), int(y0)), (int(x0 + w), int(y0 + h)), (255, 255, 0), 2)
-
-        quad = dbg.get("roi_quad", None)
-        if quad and isinstance(quad, list) and len(quad) == 4:
-            q = np.array(quad, dtype=np.int32).reshape(4, 2)
-            cv2.polylines(out, [q.reshape(-1, 1, 2)], True, (0, 255, 255), 3)
-            for i, (x, y) in enumerate(q):
-                cv2.circle(out, (int(x), int(y)), 6, (0, 255, 255), -1)
-                cv2.putText(out, f"{i}", (int(x) + 8, int(y) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
-
-        return out
-
     def _draw_overlay(
         self,
         img: np.ndarray,
@@ -1053,23 +1074,23 @@ class PCBInspectorNode(Node):
         mismatches: List[Dict[str, Any]],
         missing: List[Dict[str, Any]],
         extra: List[Dict[str, Any]],
-        tx: float = 0.0,
-        ty: float = 0.0,
+        tx: float,
+        ty: float,
+        roi_dbg: Dict[str, Any],
     ) -> np.ndarray:
         out = img.copy()
 
-        # draw ROI polygon
+        # ROI polygon
         q = roi.quad.astype(np.int32).reshape(4, 2)
         cv2.polylines(out, [q.reshape(-1, 1, 2)], True, (0, 255, 255), 3)
 
-        # expected (baseline)
+        # expected baseline boxes
         if baseline is not None:
             for cls, entries in baseline.items():
                 for i, be in enumerate(entries):
                     x1, y1, x2, y2 = self._px_from_roi_mean(be.mean, roi)
                     cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                    cv2.putText(out, f"EXP {cls}[{i}]", (x1, y2 + 14),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(out, f"EXP {cls}[{i}]", (x1, y2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
         bad_set = {(m["class"], int(m["index"])) for m in mismatches}
 
@@ -1078,16 +1099,16 @@ class PCBInspectorNode(Node):
             for i, d in enumerate(lst):
                 x1, y1, x2, y2 = self._px_from_roi(d, roi)
                 if (cls, i) in bad_set:
-                    color = (0, 0, 255)  # red
+                    color = (0, 0, 255)
                     tag = "BAD"
                 else:
-                    color = (0, 255, 0)  # green
+                    color = (0, 255, 0)
                     tag = "OK"
                 cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(out, f"{tag} {cls}[{i}] {d.conf:.2f}", (x1, max(0, y1 - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-        # missing (draw expected in red)
+        # missing
         if baseline is not None:
             for m in missing:
                 cls = str(m["class"])
@@ -1099,13 +1120,10 @@ class PCBInspectorNode(Node):
                     cv2.putText(out, f"MISSING {cls}[{idx}]", (x1, max(0, y1 - 5)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
 
-        # extra (orange)
+        # extra
         for e in extra:
-            d = Det(
-                cls=str(e["class"]),
-                x=float(e["x"]), y=float(e["y"]), w=float(e["w"]), h=float(e["h"]),
-                conf=float(e.get("conf", 0.0)),
-            )
+            d = Det(cls=str(e["class"]), x=float(e["x"]), y=float(e["y"]), w=float(e["w"]), h=float(e["h"]),
+                    conf=float(e.get("conf", 0.0)))
             x1, y1, x2, y2 = self._px_from_roi(d, roi)
             cv2.rectangle(out, (x1, y1), (x2, y2), (0, 165, 255), 3)
             cv2.putText(out, f"EXTRA {d.cls} {d.conf:.2f}", (x1, y2 + 18),
@@ -1113,6 +1131,13 @@ class PCBInspectorNode(Node):
 
         cv2.putText(out, f"align tx={tx:.6f} ty={ty:.6f}", (10, out.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # also draw candidate points (magenta) for quick tuning
+        if bool(self.get_parameter("draw_roi_debug").value):
+            cand = roi_dbg.get("cand_pts", [])
+            for c in cand[:30]:
+                x, y = int(round(c[0])), int(round(c[1]))
+                cv2.circle(out, (x, y), 4, (255, 0, 255), -1)
 
         return out
 
