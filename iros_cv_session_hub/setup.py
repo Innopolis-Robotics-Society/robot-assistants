@@ -3,7 +3,7 @@ import os
 
 from setuptools import find_packages, setup
 
-package_name = "cv_session_hub"
+package_name = "iros_cv_session_hub"
 
 setup(
     name=package_name,
@@ -23,7 +23,7 @@ setup(
     extras_require={"test": ["pytest"]},
     entry_points={
         "console_scripts": [
-            "cv_session_hub = cv_session_hub.cv_session_hub_node:main",
+            "iros_cv_session_hub = iros_cv_session_hub.cv_session_hub_node:main",
         ],
     },
 )

@@ -209,7 +209,7 @@ class PCBInspectorNode(Node):
         self.declare_parameter("draw_roi_debug", True)
 
         # Topics
-        img_topic = str(self.get_parameter("image_raw").value)
+        img_topic = str(self.get_parameter("image_topic").value)
         self._sub = self.create_subscription(Image, img_topic, self._on_image, 10, callback_group=self._cbg)
         self._pub_annot = self.create_publisher(Image, "~/annotated", 10)
         self._pub_report = self.create_publisher(String, "~/report", 10)

@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 from glob import glob
 import os
 
-package_name = "rust_detect_ros"
+package_name = "iros_rust_detect_ros"
 
 setup(
     name=package_name,
@@ -22,7 +22,7 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "rust_detect_node = rust_detect_ros.rust_detect_node:main",
+            "rust_detect_node = iros_rust_detect_ros.rust_detect_node:main",
         ],
     },
 )
