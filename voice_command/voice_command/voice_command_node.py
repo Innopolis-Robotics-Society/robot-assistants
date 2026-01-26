@@ -1,34 +1,76 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+
 import json
-import pyttsx3
+import threading
+import queue
+import numpy as np
+import sounddevice as sd
+import torch
 
 
+
+# =========================
+# Словарь фраз
+# =========================
 VOICE_PHRASES = {
-    "take": {
-        "default": "I am bringing the {tool}.",
-    },
-    "put_back": {
-        "default": "I am putting the {tool} back.",
-    },
-    "stop": {
-        "default": "Stopping current action.",
-    },
-    "help": {
-        "default": "You can ask me to take, return tools, or stop.",
-    }
+    "take": "I am bringing the {tool}.",
+    "put_back": "I am putting the {tool} back.",
+    "stop": "Stopping current action.",
+    "help": "You can ask me to take, return tools, or stop.",
+    "greeting": "Hello! I am ready to assist you."
 }
 
 
-class VoiceFeedbackNode(Node):
+# =========================
+# Класс Kokoro TTS
+# =========================
 
+from kokoro import KPipeline
+
+
+class KokoroTTS:
+    def __init__(self, voice="af_heart"):
+        self.voice = voice
+        self.pipeline = None
+        self.sample_rate = 24000
+
+    def initialize(self, logger):
+        logger.info("Loading Kokoro TTS model...")
+        self.pipeline = KPipeline(lang_code="a")  # auto language
+        # прогрев
+        _ = self.synthesize("System ready")
+        logger.info("✅ Kokoro TTS ready")
+        return True
+
+    def synthesize(self, text: str):
+        """
+        Kokoro возвращает генератор:
+        (phonemes, tokens, audio)
+        """
+        audio = None
+        for _, _, audio_chunk in self.pipeline(text, voice=self.voice):
+            audio = audio_chunk
+
+        if audio is None:
+            raise RuntimeError("Kokoro produced no audio")
+
+        return audio, self.sample_rate
+
+# =========================
+# ROS 2 Node
+# =========================
+class VoiceFeedbackNode(Node):
     def __init__(self):
         super().__init__('voice_feedback_node')
 
-        self.engine = pyttsx3.init()
-        self.engine.setProperty('rate', 160)
+        # Инициализация TTS
+        self.tts = KokoroTTS(voice="af_bella")
+        self.audio_queue = queue.Queue()
+        self.is_playing = False
 
+        # Подписка на топик
         self.subscription = self.create_subscription(
             String,
             '/voice/command',
@@ -36,41 +78,77 @@ class VoiceFeedbackNode(Node):
             10
         )
 
-        self.get_logger().info('Voice feedback node started')
+        # Таймер для воспроизведения
+        self.timer = self.create_timer(0.1, self.play_from_queue)
+
+        # Инициализация TTS в отдельном потоке
+        threading.Thread(target=self.init_tts, daemon=True).start()
+
+        self.get_logger().info("Voice feedback node started")
+
+    def init_tts(self):
+        try:
+            self.tts.initialize(self.get_logger())
+        except Exception as e:
+            self.get_logger().error(f"Failed to initialize Silero TTS: {e}")
 
     def command_callback(self, msg: String):
         try:
             data = json.loads(msg.data)
         except json.JSONDecodeError:
-            self.get_logger().error('Invalid JSON received')
+            self.get_logger().error("Invalid JSON")
             return
 
         intent = data.get("intent")
-        tool = data.get("tool")
-        confidence = data.get("confidence", 0.0)
+        tool = data.get("tool", "")
 
         if intent not in VOICE_PHRASES:
             self.get_logger().warn(f"Unknown intent: {intent}")
             return
 
-        phrase_template = VOICE_PHRASES[intent]["default"]
+        text = VOICE_PHRASES[intent]
+        if "{tool}" in text:
+            text = text.format(tool=tool or "the tool")
 
-        if "{tool}" in phrase_template:
-            if tool is None:
-                self.get_logger().warn("Tool missing in command")
-                return
-            phrase = phrase_template.format(tool=tool)
-        else:
-            phrase = phrase_template
+        self.get_logger().info(f"Speaking: {text}")
 
-        self.get_logger().info(f"Speaking: {phrase}")
-        self.speak(phrase)
+        # Асинхронная генерация речи
+        threading.Thread(
+            target=self.generate_audio,
+            args=(text,),
+            daemon=True
+        ).start()
 
-    def speak(self, text: str):
-        self.engine.say(text)
-        self.engine.runAndWait()
+    def generate_audio(self, text):
+        try:
+            audio, sr = self.tts.synthesize(text)
+            self.audio_queue.put((audio, sr, text))
+        except Exception as e:
+            self.get_logger().error(f"TTS generation failed: {e}")
+
+    def play_from_queue(self):
+        if self.is_playing or self.audio_queue.empty():
+            return
+
+        audio, sr, text = self.audio_queue.get()
+        self.is_playing = True
+
+        def play():
+            try:
+                self.get_logger().info(f"🔊 Playing: {text}")
+                sd.play(audio, sr)
+                sd.wait()
+            except Exception as e:
+                self.get_logger().error(f"Playback failed: {e}")
+            finally:
+                self.is_playing = False
+
+        threading.Thread(target=play, daemon=True).start()
 
 
+# =========================
+# main
+# =========================
 def main(args=None):
     rclpy.init(args=args)
     node = VoiceFeedbackNode()
