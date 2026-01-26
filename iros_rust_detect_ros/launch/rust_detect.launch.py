@@ -4,12 +4,12 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         Node(
-            package="rust_detect_ros",
+            package="iros_rust_detect_ros",
             executable="rust_detect_node",
             name="rust_detect_node",
             output="screen",
             parameters=[{
-                "weights": "runs/linknet_mobilenetv2_bin/best.pt",
+                "weights": "/home/mobile/ros2_ws/src/iros_rust_detect_ros/models/speedup_l1_s0.35.pth",
                 "arch": "linknet",
                 "encoder": "mobilenet_v2",
                 "classes": 2,
@@ -19,8 +19,8 @@ def generate_launch_description():
                 "thr": 0.35,
                 "min_area": 200,
                 "close_k": 0,
-                "image_topic": "/camera/image_raw",
-                "camera_info_topic": "/camera/camera_info",
+                "image_topic": "/image_raw",
+                "camera_info_topic": "/camera_info",
             }],
         )
     ])

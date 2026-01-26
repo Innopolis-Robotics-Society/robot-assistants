@@ -13,6 +13,11 @@ def generate_launch_description():
     ur_cfg = PathJoinSubstitution([FindPackageShare("iros_assistant_bringup"), "config", "UR10e-1.yaml"])
     rviz_cfg = PathJoinSubstitution([FindPackageShare("iros_assistant_bringup"), "rviz", "inspector.rviz"])
 
+    video_device_arg = DeclareLaunchArgument(
+        "video_device",
+        default_value="/dev/video0",
+    )
+
     robot_ip_arg = DeclareLaunchArgument(
         "robot_ip",
         default_value="192.168.0.15",
@@ -24,6 +29,7 @@ def generate_launch_description():
         default_value="robopro",  # e.g. ur10e / ur5e / ur3e / robopro
     )
 
+    video_device = LaunchConfiguration("video_device")
     robot_ip = LaunchConfiguration("robot_ip")
     robot_model = LaunchConfiguration("robot_model")
 
@@ -75,6 +81,12 @@ def generate_launch_description():
         ],
     )
 
+    camera = Node(
+        package="v4l2_camera",
+        executable="v4l2_camera_node",
+        parameters=[{"video_device": video_device}],
+    )
+
     tf = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
@@ -91,61 +103,22 @@ def generate_launch_description():
         launch_arguments=[],
     )
 
-    azure_driver = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            [
-                PathJoinSubstitution(
-                    [
-                        FindPackageShare("azure_kinect_ros_driver"),
-                        "launch",
-                        "driver.launch.py",
-                    ]
-                )
-            ]
-        ),
-        launch_arguments={
-            # только RGB
-            "color_enabled": "true",
-            "color_resolution": "3072P",   # максимум деталей (4096x3072)
-            "color_format": "bgra",        # без JPEG-артефактов (тяжелее по CPU/USB)
-            "fps": "15",                   # 3072P не бывает 30 FPS
 
-            # всё остальное выключаем
-            "depth_enabled": "false",
-            "point_cloud": "false",
-            "rgb_point_cloud": "false",
-            "point_cloud_in_depth_frame": "false",
-
-            # лишние сенсоры/фичи
-            "imu_rate_target": "0",
-            "wired_sync_mode": "0",
-            "body_tracking_enabled": "false",
-            "body_tracking_smoothing_factor": "0.0",
-
-            # на всякий случай
-            "rescale_ir_to_mono8": "false",
-        }.items(),
-    )
 
     cv_pipeline = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
                 PathJoinSubstitution(
                     [
-                        FindPackageShare("iros_cv_algorithms"),
+                        FindPackageShare("iros_cv_session_hub"),
                         "launch",
-                        "cv_algorithms.launch.py",
+                        "cv_stack.launch.py",
                     ]
                 )
             ]
         ),
         launch_arguments=[
-            ("mode", "trigger"),
-            ("image_topic", "/rgb/image_raw"),
-            ("image_timeout_s", "2.0"),
-            ("result_prefix", "/cv_algorithms/result"),
-            ("trigger_service", "/cv_algorithms/run"),
-            ("process_period_s", "2.0"),
+            ("image_topic", "/image_raw"),
         ],
     )
 
@@ -180,11 +153,12 @@ def generate_launch_description():
         [
             robot_model_arg,
             robot_ip_arg,
+            video_device_arg,
             tf,
+            camera,
             ur_launch,
-            #robopro_launch,
-            azure_driver,
-            #cv_pipeline,
+            robopro_launch,
+            cv_pipeline,
             voice_rec,
             behavior,
             rviz,

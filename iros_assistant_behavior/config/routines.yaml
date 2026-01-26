@@ -1,54 +1,81 @@
 routines:
   inspect:
     steps:
-      # 1) позиция для инспекции
       - type: service
         service_name: /go_to_frame
         service_type: iros_custom_msgs/srv/GoToFrame
-        request:
-          frame: pose_up
+        request: { frame: pose_up }
+        delay_after_sec: 0.5
 
-      # 2) запуск CV
       - type: service
-        service_name: /cv_algorithms/run
+        service_name: /iros_cv_session_hub/run_rust
         service_type: std_srvs/srv/Trigger
         request: {}
+        service_timeout_sec: 20.0
+        delay_after_sec: 0.5
 
-      # 3) ждём итог CV (true/false)
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request: { frame: poi_pcb }
+        delay_after_sec: 0.5
+
+      - type: service
+        service_name: /iros_cv_session_hub/run_pcb
+        service_type: std_srvs/srv/Trigger
+        request: {}
+        service_timeout_sec: 20.0
+        delay_after_sec: 0.5
+
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request: { frame: poi_gear_common }
+        delay_after_sec: 0.5
+
+      - type: service
+        service_name: /iros_cv_session_hub/run_gear
+        service_type: std_srvs/srv/Trigger
+        request: {}
+        service_timeout_sec: 20.0
+        delay_after_sec: 0.5
+
+      - type: service
+        service_name: /iros_cv_session_hub/publish
+        service_type: std_srvs/srv/Trigger
+        request: {}
+        service_timeout_sec: 20.0
+        delay_after_sec: 0.5
+
       - type: wait_topic
-        topic_name: /cv_algorithms/result/summary
+        topic_name: /cv_hub/result/summary
         topic_type: std_msgs/msg/Bool
         store_as: cv_ok
         timeout_sec: 15.0
-
-      # 3.5) открыть захват
-      - type: service
-        service_name: /gripper_action
-        service_type: iros_custom_msgs/srv/GripperAction
-        request:
-          open: true
-
-      # 4) подойти к точке захвата
-
-      - type: service
-        service_name: /go_to_frame
-        service_type: iros_custom_msgs/srv/GoToFrame
-        request:
-          frame: pose_pick_up
-
-      - type: service
-        service_name: /go_to_frame
-        service_type: iros_custom_msgs/srv/GoToFrame
-        request:
-          frame: pose_pick
-
-      # 5) закрыть захват
+        delay_after_sec: 0.5
 
       - type: service
         service_name: /gripper_action
         service_type: iros_custom_msgs/srv/GripperAction
-        request:
-          open: false
+        request: { open: true }
+        delay_after_sec: 0.5
+
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request: { frame: pose_pick_up }
+        delay_after_sec: 0.5
+
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request: { frame: pose_pick }
+        delay_after_sec: 0.5
+
+      - type: service
+        service_name: /gripper_action
+        service_type: iros_custom_msgs/srv/GripperAction
+        request: { open: false }
 
       - type: sleep
         duration_sec: 0.5
@@ -56,10 +83,9 @@ routines:
       - type: service
         service_name: /go_to_frame
         service_type: iros_custom_msgs/srv/GoToFrame
-        request:
-          frame: pose_pick_up
+        request: { frame: pose_pick_up }
+        delay_after_sec: 0.5
 
-      # 6) развилка по результату CV
       - type: branch
         var: cv_ok
         cases:
@@ -67,51 +93,59 @@ routines:
             - type: service
               service_name: /go_to_frame
               service_type: iros_custom_msgs/srv/GoToFrame
-              request:
-                frame: pose_drop_ok_up
+              request: { frame: pose_drop_ok_up }
             - type: service
               service_name: /go_to_frame
               service_type: iros_custom_msgs/srv/GoToFrame
-              request:
-                frame: pose_drop_ok
-            # 7) открыть захват (отпустить предмет)
+              request: { frame: pose_drop_ok }
             - type: service
               service_name: /gripper_action
               service_type: iros_custom_msgs/srv/GripperAction
-              request:
-                open: true
-
+              request: { open: true }
             - type: sleep
               duration_sec: 0.5
-
             - type: service
               service_name: /go_to_frame
               service_type: iros_custom_msgs/srv/GoToFrame
-              request:
-                frame: pose_drop_ok_up
+              request: { frame: pose_drop_ok_up }
+
           false:
             - type: service
               service_name: /go_to_frame
               service_type: iros_custom_msgs/srv/GoToFrame
-              request:
-                frame: pose_drop_nok_up
+              request: { frame: pose_drop_nok_up }
             - type: service
               service_name: /go_to_frame
               service_type: iros_custom_msgs/srv/GoToFrame
-              request:
-                frame: pose_drop_nok
-            # 7) открыть захват (отпустить предмет)
+              request: { frame: pose_drop_nok }
             - type: service
               service_name: /gripper_action
               service_type: iros_custom_msgs/srv/GripperAction
-              request:
-                open: true
-
+              request: { open: true }
             - type: sleep
               duration_sec: 0.5
-
             - type: service
               service_name: /go_to_frame
               service_type: iros_custom_msgs/srv/GoToFrame
-              request:
-                frame: pose_drop_nok_up
+              request: { frame: pose_drop_nok_up }
+
+  calibration:
+    steps:
+      - type: service
+        service_name: /go_to_frame
+        service_type: iros_custom_msgs/srv/GoToFrame
+        request: { frame: poi_pcb }
+
+      - type: service
+        service_name: /pcb_inspector/calibration
+        service_type: std_srvs/srv/Trigger
+        request: {}
+        service_timeout_sec: 20.0
+
+  reset:
+    steps:
+      - type: service
+        service_name: /pcb_inspector/reset
+        service_type: std_srvs/srv/Trigger
+        request: {}
+        service_timeout_sec: 20.0

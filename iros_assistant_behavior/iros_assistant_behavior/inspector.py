@@ -1,521 +1,435 @@
 #!/usr/bin/env python3
+import importlib
 import json
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, List
+
+import yaml
 
 import rclpy
 from rclpy.node import Node
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
 from std_msgs.msg import String
 
-from rosidl_runtime_py.utilities import get_service, get_message
-from rosidl_runtime_py.set_message import set_message_fields
 
+# ROS2: set_message_fields находится тут
 try:
-    import yaml
-except ImportError:
-    yaml = None
+    from rosidl_runtime_py.set_message import set_message_fields  # type: ignore
+except Exception:
+    # fallback (упрощённый)
+    def set_message_fields(msg: Any, values: Dict[str, Any], strict_mode: bool = False) -> None:
+        for k, v in values.items():
+            if hasattr(msg, k):
+                setattr(msg, k, v)
 
 
-# ---------- Step model ----------
-
-@dataclass
-class StepSpec:
-    step_type: str
-
-    # service step
-    service_name: str = ""
-    service_type: str = ""
-    request: Dict[str, Any] = field(default_factory=dict)
-    success_field: str = "success"
-    message_field: str = "message"
-
-    # wait_topic step
-    topic_name: str = ""
-    topic_type: str = ""          # e.g. "std_msgs/msg/Bool"
-    store_as: str = ""            # e.g. "cv_ok"
-    timeout_sec: float = 0.0
-
-    # branch step
-    var: str = ""                 # e.g. "cv_ok"
-    cases: Dict[Any, List[Dict[str, Any]]] = field(default_factory=dict)  # raw dict steps
-
-    # sleep step
-    duration_sec: float = 0.0
+def _import_srv(type_str: str):
+    # "pkg/srv/Name"
+    parts = type_str.split("/")
+    if len(parts) != 3 or parts[1] != "srv":
+        raise ValueError(f"Bad service_type '{type_str}', expected 'pkg/srv/Name'")
+    pkg, _, name = parts
+    mod = importlib.import_module(f"{pkg}.srv")
+    return getattr(mod, name)
 
 
-def _parse_bool_like(v: Any) -> Optional[bool]:
+def _import_msg(type_str: str):
+    # "pkg/msg/Name"
+    parts = type_str.split("/")
+    if len(parts) != 3 or parts[1] != "msg":
+        raise ValueError(f"Bad topic_type '{type_str}', expected 'pkg/msg/Name'")
+    pkg, _, name = parts
+    mod = importlib.import_module(f"{pkg}.msg")
+    return getattr(mod, name)
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def _as_bool(v: Any) -> bool:
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)):
-        if v == 0:
-            return False
-        if v == 1:
-            return True
-        return None
+        return bool(v)
     if isinstance(v, str):
-        s = v.strip().lower()
-        if s in ("true", "1", "yes", "y", "ok"):
-            return True
-        if s in ("false", "0", "no", "n", "nok"):
-            return False
-    return None
+        return v.strip().lower() in ("1", "true", "yes", "y", "ok")
+    return bool(v)
 
 
-class ServiceClientCache:
-    def __init__(self, node: Node):
-        self._node = node
-        self._clients: Dict[Tuple[str, str], Any] = {}
-        self._cb_group = MutuallyExclusiveCallbackGroup()
+@dataclass
+class ActiveWaitTopic:
+    topic: str
+    started_at: float
+    timeout: float
+    store_as: str
 
-    def get_client(self, srv_type_str: str, srv_name: str):
-        key = (srv_type_str, srv_name)
-        if key in self._clients:
-            return self._clients[key]
 
-        srv_cls = get_service(srv_type_str)
-        client = self._node.create_client(srv_cls, srv_name, callback_group=self._cb_group)
-        self._clients[key] = client
-        return client
+@dataclass
+class ActiveServiceCall:
+    service_name: str
+    started_at: float
+    timeout: float
+    future: Any
+    store_as: Optional[str] = None
+
+
+@dataclass
+class ActiveSleep:
+    until: float
 
 
 class RoutineRunner:
-    def __init__(self, node: Node, client_cache: ServiceClientCache, steps: List[StepSpec],
-                 context: Dict[str, Any], done_cb):
-        self._node = node
-        self._client_cache = client_cache
-        self._steps = steps
-        self._context = context
-        self._done_cb = done_cb
-        self._idx = 0
+    def __init__(self, node: Node):
+        self.node = node
+        self.cb_group = ReentrantCallbackGroup()
 
-        self._active_sub = None
-        self._timeout_timer = None
-        self._sleep_timer = None
+        self.routines: Dict[str, Any] = {}
+        self.ctx: Dict[str, Any] = {}
 
-    def start(self):
-        self._run_next()
+        self._steps: List[Dict[str, Any]] = []
+        self._ip: int = 0
+        self._running: bool = False
+        self._routine_name: str = ""
 
-    def _run_next(self):
-        if self._idx >= len(self._steps):
-            self._done_cb(True, "routine completed")
+        self._active_wait_topic: Optional[ActiveWaitTopic] = None
+        self._active_service: Optional[ActiveServiceCall] = None
+        self._active_sleep: Optional[ActiveSleep] = None
+        self._waiting_until: float = 0.0
+
+        self._clients: Dict[str, Any] = {}
+        self._subs: Dict[str, Any] = {}
+
+    def load_from_file(self, path: str) -> None:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        routines = data.get("routines", data)
+        if not isinstance(routines, dict):
+            raise ValueError("routines.yaml: expected dict at top-level or in key 'routines'")
+        self.routines = routines
+        self.node.get_logger().info(f"Loaded routines: {list(self.routines.keys())} (file={path})")
+
+    @property
+    def busy(self) -> bool:
+        return self._running
+
+    def start(self, name: str) -> None:
+        if self._running:
+            self.node.get_logger().warn(f"Busy with '{self._routine_name}', ignore new routine '{name}'")
             return
 
-        step = self._steps[self._idx]
+        routine = self.routines.get(name)
+        if routine is None:
+            self.node.get_logger().warn(f"Unknown routine '{name}'. Available: {list(self.routines.keys())}")
+            return
 
-        if step.step_type == "service":
-            self._run_service(step); return
-        if step.step_type == "wait_topic":
-            self._run_wait_topic(step); return
-        if step.step_type == "branch":
-            self._run_branch(step); return
-        if step.step_type == "sleep":
-            self._run_sleep(step); return
+        steps = routine.get("steps", [])
+        if not isinstance(steps, list) or len(steps) == 0:
+            self.node.get_logger().warn(f"Routine '{name}' has no steps")
+            return
 
-        self._done_cb(False, f"unsupported step_type: {step.step_type}")
+        self.ctx = {}
+        self._steps = steps
+        self._ip = 0
+        self._running = True
+        self._routine_name = name
 
-    # ---- service ----
-    def _run_service(self, step: StepSpec):
-        client = self._client_cache.get_client(step.service_type, step.service_name)
+        self._active_wait_topic = None
+        self._active_service = None
+        self._active_sleep = None
+        self._waiting_until = 0.0
 
-        if not client.service_is_ready():
-            self._node.get_logger().info(
-                f"[step {self._idx}] waiting for service {step.service_name} ({step.service_type})..."
-            )
-            if not client.wait_for_service(timeout_sec=2.0):
-                self._done_cb(False, f"service not available: {step.service_name}")
+        self.node.get_logger().info(f"Start routine '{name}', steps={len(steps)}")
+
+    def _finish_step(self) -> None:
+        delay_global = float(self.node.get_parameter("post_step_delay_sec").value)
+        delay_after = 0.0
+
+        step = self._steps[self._ip]
+        if isinstance(step, dict):
+            delay_after = float(step.get("delay_after_sec", 0.0) or 0.0)
+
+        self._waiting_until = _now() + delay_global + delay_after
+        self._ip += 1
+
+        self._active_wait_topic = None
+        self._active_service = None
+        self._active_sleep = None
+
+    def _abort(self, reason: str) -> None:
+        self.node.get_logger().error(f"Routine '{self._routine_name}' aborted: {reason}")
+        self._running = False
+
+        # cleanup wait subscriptions
+        for key, sub in list(self._subs.items()):
+            try:
+                self.node.destroy_subscription(sub)
+            except Exception:
+                pass
+            self._subs.pop(key, None)
+
+        self._active_wait_topic = None
+        self._active_service = None
+        self._active_sleep = None
+
+    def _get_client(self, service_name: str, srv_type: str):
+        key = f"{service_name}|{srv_type}"
+        if key in self._clients:
+            return self._clients[key]
+        srv_cls = _import_srv(srv_type)
+        client = self.node.create_client(srv_cls, service_name, callback_group=self.cb_group)
+        self._clients[key] = client
+        return client
+
+    def _wait_topic_cb(self, store_as: str, sub_key: str, msg: Any) -> None:
+        # сохраняем "msg.data" если есть, иначе весь msg
+        val = getattr(msg, "data", msg)
+        self.ctx[store_as] = val
+        self.node.get_logger().info(f"[wait_topic] got {sub_key}: {val}")
+
+        sub = self._subs.pop(sub_key, None)
+        if sub is not None:
+            try:
+                self.node.destroy_subscription(sub)
+            except Exception:
+                pass
+
+        self._active_wait_topic = None
+        self._finish_step()
+
+    def tick(self) -> None:
+        if not self._running:
+            return
+
+        t = _now()
+        if t < self._waiting_until:
+            return
+
+        if self._ip >= len(self._steps):
+            self.node.get_logger().info(f"Routine '{self._routine_name}' finished OK")
+            self._running = False
+            return
+
+        step = self._steps[self._ip]
+        if not isinstance(step, dict):
+            self._abort(f"step {self._ip} must be dict, got {type(step)}")
+            return
+
+        stype = step.get("type")
+        if stype is None:
+            self._abort(f"step {self._ip} has no 'type'")
+            return
+
+        # --- ACTIVE: service ---
+        if self._active_service is not None:
+            if t - self._active_service.started_at > self._active_service.timeout:
+                self._abort(f"service timeout: {self._active_service.service_name}")
+                return
+            if self._active_service.future.done():
+                try:
+                    resp = self._active_service.future.result()
+                except Exception as e:
+                    self._abort(f"service exception: {self._active_service.service_name}: {e}")
+                    return
+
+                # если есть поле success и оно False — считаем провалом (для GoToFrame/GripperAction)
+                if hasattr(resp, "success") and (resp.success is False):
+                    msg = getattr(resp, "message", "")
+                    if bool(self.node.get_parameter("abort_on_failure").value):
+                        self._abort(f"{self._active_service.service_name} returned success=False: {msg}")
+                        return
+                    self.node.get_logger().warn(
+                        f"{self._active_service.service_name} returned success=False: {msg} (continue)"
+                    )
+
+                if self._active_service.store_as:
+                    self.ctx[self._active_service.store_as] = resp
+
+                # лог (короткий)
+                m = getattr(resp, "message", None)
+                if isinstance(m, str) and len(m) > 200:
+                    m = m[:200] + "..."
+                if m is not None:
+                    self.node.get_logger().info(f"[service] {self._active_service.service_name} message={m}")
+
+                self._finish_step()
+            return
+
+        # --- ACTIVE: wait_topic ---
+        if self._active_wait_topic is not None:
+            if t - self._active_wait_topic.started_at > self._active_wait_topic.timeout:
+                self._abort(f"wait_topic timeout: {self._active_wait_topic.topic}")
+            return
+
+        # --- ACTIVE: sleep ---
+        if self._active_sleep is not None:
+            if t >= self._active_sleep.until:
+                self._finish_step()
+            return
+
+        # --- START step ---
+        if stype == "sleep":
+            dur = float(step.get("duration_sec", 0.0))
+            self.node.get_logger().info(f"[step {self._ip}] sleep {dur}s")
+            self._active_sleep = ActiveSleep(until=t + dur)
+            return
+
+        if stype == "service":
+            service_name = str(step["service_name"])
+            srv_type = str(step["service_type"])
+            req_dict = step.get("request", {}) or {}
+
+            timeout = step.get("service_timeout_sec", None)
+            if timeout is None:
+                timeout = float(self.node.get_parameter("default_service_timeout_sec").value)
+            timeout = float(timeout)
+
+            store_as = step.get("store_as", None)
+
+            client = self._get_client(service_name, srv_type)
+            if not client.service_is_ready():
+                # не блокируемся — ждём готовности
+                # (таймаут считаем от момента "начала шага")
+                self.node.get_logger().info(f"[step {self._ip}] wait service {service_name} ...")
+                # имитируем активный сервис-стейт без future, чтобы отлавливать таймаут
+                dummy_future = rclpy.task.Future()
+                self._active_service = ActiveServiceCall(
+                    service_name=service_name, started_at=t, timeout=timeout, future=dummy_future
+                )
+                # но future не завершится; поэтому перепишем логику: как только сервис появится — стартанём заново
+                # (упрощение: сбросим active_service и попробуем снова в следующем tick)
+                self._active_service = None
+                self._waiting_until = t + 0.1
                 return
 
-        srv_cls = get_service(step.service_type)
-        req = srv_cls.Request()
+            srv_cls = _import_srv(srv_type)
+            req = srv_cls.Request()
+            if isinstance(req_dict, dict) and len(req_dict) > 0:
+                set_message_fields(req, req_dict, False)
 
-        # "$var" templating from context
-        req_dict = {}
-        for k, v in (step.request or {}).items():
-            if isinstance(v, str) and v.startswith("$"):
-                req_dict[k] = self._context.get(v[1:], v)
+            self.node.get_logger().info(f"[step {self._ip}] call {service_name} {srv_type} req={req_dict}")
+            future = client.call_async(req)
+            self._active_service = ActiveServiceCall(
+                service_name=service_name,
+                started_at=t,
+                timeout=timeout,
+                future=future,
+                store_as=store_as,
+            )
+            return
+
+        if stype == "wait_topic":
+            topic = str(step["topic_name"])
+            topic_type = str(step["topic_type"])
+            store_as = str(step.get("store_as", "topic_value"))
+            timeout = float(step.get("timeout_sec", 10.0))
+
+            msg_cls = _import_msg(topic_type)
+
+            sub_key = f"{topic}|{topic_type}|{store_as}"
+            if sub_key not in self._subs:
+                self.node.get_logger().info(f"[step {self._ip}] wait topic {topic} ({topic_type}) -> {store_as}")
+                sub = self.node.create_subscription(
+                    msg_cls,
+                    topic,
+                    lambda msg, _sa=store_as, _k=sub_key: self._wait_topic_cb(_sa, _k, msg),
+                    10,
+                    callback_group=self.cb_group,
+                )
+                self._subs[sub_key] = sub
+
+            self._active_wait_topic = ActiveWaitTopic(topic=topic, started_at=t, timeout=timeout, store_as=store_as)
+            return
+
+        if stype == "branch":
+            var = str(step["var"])
+            cases = step.get("cases", {}) or {}
+            val = self.ctx.get(var, False)
+            b = _as_bool(val)
+
+            # YAML "true/false" могут стать bool-ключами True/False
+            selected = None
+            if b in cases:
+                selected = cases[b]
             else:
-                req_dict[k] = v
+                selected = cases.get("true" if b else "false")
 
-        set_message_fields(req, req_dict)
+            if selected is None:
+                self._abort(f"branch: no case for {b} in var '{var}'")
+                return
+            if not isinstance(selected, list):
+                self._abort("branch: case must be list of steps")
+                return
 
-        self._node.get_logger().info(
-            f"[step {self._idx}] call {step.service_name} {step.service_type} req={req_dict}"
-        )
-        future = client.call_async(req)
-        future.add_done_callback(lambda fut: self._on_service_done(step, fut))
+            self.node.get_logger().info(f"[step {self._ip}] branch var='{var}' -> {b}, insert {len(selected)} steps")
 
-    def _on_service_done(self, step: StepSpec, future):
-        try:
-            resp = future.result()
-        except Exception as e:
-            self._done_cb(False, f"service call failed: {step.service_name}: {e}")
+            # заменяем текущий branch на выбранные шаги
+            self._steps = self._steps[: self._ip] + selected + self._steps[self._ip + 1 :]
             return
 
-        ok = True
-        msg = ""
-        if hasattr(resp, step.success_field):
-            ok = bool(getattr(resp, step.success_field))
-        if hasattr(resp, step.message_field):
-            msg = str(getattr(resp, step.message_field))
-
-        if not ok:
-            self._done_cb(False, f"step failed: {step.service_name}: {msg}".strip())
-            return
-
-        self._node.get_logger().info(f"[step {self._idx}] ok: {step.service_name} {msg}".strip())
-        self._idx += 1
-        self._run_next()
-
-    # ---- wait topic ----
-    def _run_wait_topic(self, step: StepSpec):
-        if not step.topic_name or not step.topic_type or not step.store_as:
-            self._done_cb(False, "wait_topic: topic_name/topic_type/store_as required")
-            return
-
-        msg_cls = get_message(step.topic_type)
-        self._cleanup_wait_resources()
-
-        self._node.get_logger().info(
-            f"[step {self._idx}] wait topic {step.topic_name} ({step.topic_type}) -> store '{step.store_as}'"
-        )
-
-        def _cb(msg):
-            val = getattr(msg, "data", None)
-
-            if step.topic_type in ("std_msgs/msg/Bool",) or step.topic_type.endswith("/Bool"):
-                parsed = bool(val)
-            else:
-                b = _parse_bool_like(val)
-                parsed = b if b is not None else val
-
-            self._context[step.store_as] = parsed
-            self._node.get_logger().info(f"[step {self._idx}] got {step.topic_name}: {parsed!r}")
-
-            self._cleanup_wait_resources()
-            self._idx += 1
-            self._run_next()
-
-        self._active_sub = self._node.create_subscription(msg_cls, step.topic_name, _cb, 10)
-
-        if step.timeout_sec and step.timeout_sec > 0:
-            self._timeout_timer = self._node.create_timer(step.timeout_sec, lambda: self._on_wait_timeout(step))
-
-    def _on_wait_timeout(self, step: StepSpec):
-        self._cleanup_wait_resources()
-        self._done_cb(False, f"timeout waiting for topic: {step.topic_name}")
-
-    def _cleanup_wait_resources(self):
-        if self._timeout_timer is not None:
-            try:
-                self._node.destroy_timer(self._timeout_timer)
-            except Exception:
-                pass
-            self._timeout_timer = None
-
-        if self._active_sub is not None:
-            try:
-                self._node.destroy_subscription(self._active_sub)
-            except Exception:
-                pass
-            self._active_sub = None
-
-    # ---- branch ----
-    def _run_branch(self, step: StepSpec):
-        if not step.var or not step.cases:
-            self._done_cb(False, "branch: var/cases required")
-            return
-
-        val = self._context.get(step.var, None)
-
-        chosen = None
-        if val in step.cases:
-            chosen = step.cases[val]
-        else:
-            b = _parse_bool_like(val)
-            if b in step.cases:
-                chosen = step.cases[b]
-            elif "default" in step.cases:
-                chosen = step.cases["default"]
-
-        if chosen is None:
-            self._done_cb(False, f"branch: no case for var='{step.var}' value={val!r}")
-            return
-
-        injected = [OrchestratorNode.parse_step_dict(s) for s in chosen]
-        self._node.get_logger().info(
-            f"[step {self._idx}] branch on '{step.var}'={val!r}: injecting {len(injected)} step(s)"
-        )
-
-        self._steps = self._steps[: self._idx + 1] + injected + self._steps[self._idx + 1 :]
-        self._idx += 1
-        self._run_next()
-
-    # ---- sleep ----
-    def _run_sleep(self, step: StepSpec):
-        dur = float(step.duration_sec or 0.0)
-        self._node.get_logger().info(f"[step {self._idx}] sleep {dur:.3f}s")
-
-        if dur <= 0.0:
-            self._idx += 1
-            self._run_next()
-            return
-
-        if self._sleep_timer is not None:
-            try:
-                self._node.destroy_timer(self._sleep_timer)
-            except Exception:
-                pass
-            self._sleep_timer = None
-
-        def _fire():
-            if self._sleep_timer is not None:
-                try:
-                    self._node.destroy_timer(self._sleep_timer)
-                except Exception:
-                    pass
-                self._sleep_timer = None
-            self._idx += 1
-            self._run_next()
-
-        self._sleep_timer = self._node.create_timer(dur, _fire)
+        self._abort(f"Unknown step type '{stype}' at step {self._ip}")
 
 
-class OrchestratorNode(Node):
+class Inspector(Node):
     def __init__(self):
         super().__init__("inspector")
 
-        self.declare_parameter("voice_topic", "/voice/command")
-        self.declare_parameter("status_topic", "/orchestrator/status")
         self.declare_parameter("routines_file", "")
         self.declare_parameter("min_confidence", 50.0)
+        self.declare_parameter("command_topic", "/voice/command")
 
-        self._voice_topic = self.get_parameter("voice_topic").value
-        self._status_topic = self.get_parameter("status_topic").value
-        self._routines_file = self.get_parameter("routines_file").value
-        self._min_confidence = float(self.get_parameter("min_confidence").value)
+        self.declare_parameter("post_step_delay_sec", 0.0)          # общий delay после каждого шага
+        self.declare_parameter("default_service_timeout_sec", 30.0) # если в шаге не задано
+        self.declare_parameter("abort_on_failure", True)
 
-        self._status_pub = self.create_publisher(String, self._status_topic, 10)
-        self._sub = self.create_subscription(String, self._voice_topic, self._on_iros_voice_command, 10)
+        self.runner = RoutineRunner(self)
 
-        self._client_cache = ServiceClientCache(self)
-        self._queue = deque()
-        self._busy = False
+        routines_file = str(self.get_parameter("routines_file").value)
+        if not routines_file:
+            raise RuntimeError("Parameter 'routines_file' is empty")
 
-        self._routines = self._load_routines(self._routines_file)
-        self.get_logger().info(f"Loaded routines: {list(self._routines.keys())}")
-        self._publish_status({"state": "ready", "routines": list(self._routines.keys())})
+        self.runner.load_from_file(routines_file)
 
-    def _publish_status(self, payload: Dict[str, Any]):
-        msg = String()
-        msg.data = json.dumps(payload, ensure_ascii=False)
-        self._status_pub.publish(msg)
+        topic = str(self.get_parameter("command_topic").value)
+        self.sub_cmd = self.create_subscription(String, topic, self._on_cmd, 10)
 
-    @staticmethod
-    def parse_step_dict(s: Dict[str, Any]) -> StepSpec:
-        t = str(s.get("type", "service"))
+        self.timer = self.create_timer(0.05, self.runner.tick)  # 20 Hz
 
-        if t == "service":
-            return StepSpec(
-                step_type="service",
-                service_name=str(s["service_name"]),
-                service_type=str(s["service_type"]),
-                request=dict(s.get("request", {}) or {}),
-                success_field=str(s.get("success_field", "success")),
-                message_field=str(s.get("message_field", "message")),
-            )
-
-        if t == "wait_topic":
-            return StepSpec(
-                step_type="wait_topic",
-                topic_name=str(s["topic_name"]),
-                topic_type=str(s["topic_type"]),
-                store_as=str(s["store_as"]),
-                timeout_sec=float(s.get("timeout_sec", 0.0) or 0.0),
-            )
-
-        if t == "branch":
-            return StepSpec(
-                step_type="branch",
-                var=str(s["var"]),
-                cases=s.get("cases", {}) or {},
-            )
-
-        if t == "sleep":
-            return StepSpec(
-                step_type="sleep",
-                duration_sec=float(s.get("duration_sec", 0.0) or 0.0),
-            )
-
-        return StepSpec(step_type=t)
-
-    def _load_routines(self, path: str) -> Dict[str, List[StepSpec]]:
-        # Default routine aligned with your current TF names seen in logs:
-        # pose_up, pick_pose, pose_ok, pose_nok
-        default_yaml_like = {
-            "inspect": {
-                "steps": [
-                    {
-                        "type": "service",
-                        "service_name": "/go_to_frame",
-                        "service_type": "iros_custom_msgs/srv/GoToFrame",
-                        "request": {"frame": "pose_up"},
-                    },
-                    {
-                        "type": "sleep",
-                        "duration_sec": 0.2,
-                    },
-                    {
-                        "type": "service",
-                        "service_name": "/cv_algorithms/run",
-                        "service_type": "std_srvs/srv/Trigger",
-                        "request": {},
-                    },
-                    {
-                        "type": "wait_topic",
-                        "topic_name": "/cv_algorithms/result/summary",
-                        "topic_type": "std_msgs/msg/Bool",
-                        "store_as": "cv_ok",
-                        "timeout_sec": 15.0,
-                    },
-                    {
-                        "type": "service",
-                        "service_name": "/go_to_frame",
-                        "service_type": "iros_custom_msgs/srv/GoToFrame",
-                        "request": {"frame": "pick_pose"},
-                    },
-                    {
-                        "type": "sleep",
-                        "duration_sec": 0.2,
-                    },
-                    {
-                        "type": "service",
-                        "service_name": "/gripper_action",
-                        "service_type": "iros_custom_msgs/srv/GripperAction",
-                        "request": {"open": False},
-                    },
-                    {
-                        "type": "sleep",
-                        "duration_sec": 0.2,
-                    },
-                    {
-                        "type": "branch",
-                        "var": "cv_ok",
-                        "cases": {
-                            True: [
-                                {
-                                    "type": "service",
-                                    "service_name": "/go_to_frame",
-                                    "service_type": "iros_custom_msgs/srv/GoToFrame",
-                                    "request": {"frame": "pose_ok"},
-                                }
-                            ],
-                            False: [
-                                {
-                                    "type": "service",
-                                    "service_name": "/go_to_frame",
-                                    "service_type": "iros_custom_msgs/srv/GoToFrame",
-                                    "request": {"frame": "pose_nok"},
-                                }
-                            ],
-                        },
-                    },
-                    {
-                        "type": "sleep",
-                        "duration_sec": 0.2,
-                    },
-                    {
-                        "type": "service",
-                        "service_name": "/gripper_action",
-                        "service_type": "iros_custom_msgs/srv/GripperAction",
-                        "request": {"open": True},
-                    },
-                ]
-            }
-        }
-
-        if not path:
-            return {k: [self.parse_step_dict(x) for x in v["steps"]] for k, v in default_yaml_like.items()}
-
-        if yaml is None:
-            self.get_logger().warn("PyYAML not installed; using default routines")
-            return {k: [self.parse_step_dict(x) for x in v["steps"]] for k, v in default_yaml_like.items()}
-
+    def _on_cmd(self, msg: String) -> None:
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
+            data = json.loads(msg.data)
         except Exception as e:
-            self.get_logger().warn(f"Failed to load routines_file='{path}': {e}; using default")
-            return {k: [self.parse_step_dict(x) for x in v["steps"]] for k, v in default_yaml_like.items()}
-
-        routines: Dict[str, List[StepSpec]] = {}
-        for intent, spec in (data.get("routines", {}) or {}).items():
-            raw_steps = (spec.get("steps", []) or [])
-            steps = [self.parse_step_dict(s) for s in raw_steps]
-            if steps:
-                routines[str(intent)] = steps
-
-        if not routines:
-            return {k: [self.parse_step_dict(x) for x in v["steps"]] for k, v in default_yaml_like.items()}
-        return routines
-
-    def _on_iros_voice_command(self, msg: String):
-        try:
-            payload = json.loads(msg.data)
-        except Exception as e:
-            self.get_logger().warn(f"Bad JSON on {self._voice_topic}: {e} | data={msg.data!r}")
+            self.get_logger().warn(f"Bad JSON in /voice/command: {e}")
             return
 
-        intent = payload.get("intent", None)
-        confidence = float(payload.get("confidence", 0.0))
+        intent = data.get("intent")
+        conf = float(data.get("confidence", 0.0))
 
-        if intent is None:
-            self.get_logger().warn(f"Voice command missing 'intent': {payload}")
-            return
-        if confidence < self._min_confidence:
-            self.get_logger().info(f"Ignored intent={intent} due to low confidence={confidence}")
+        min_conf = float(self.get_parameter("min_confidence").value)
+        if conf < min_conf:
+            self.get_logger().info(f"Ignore command intent='{intent}' conf={conf} < {min_conf}")
             return
 
-        routine = self._routines.get(str(intent))
-        if not routine:
-            self.get_logger().warn(f"No routine for intent='{intent}'")
-            self._publish_status({"state": "rejected", "reason": "no_routine", "intent": intent, "payload": payload})
+        if not intent:
+            self.get_logger().warn("Command has no 'intent'")
             return
 
-        self._queue.append((str(intent), payload, list(routine)))
-        self._publish_status({"state": "queued", "intent": intent, "queue_size": len(self._queue)})
-        self._try_start_next()
-
-    def _try_start_next(self):
-        if self._busy or not self._queue:
-            return
-
-        intent, payload, routine = self._queue.popleft()
-        self._busy = True
-        self._publish_status({"state": "running", "intent": intent, "payload": payload, "steps": len(routine)})
-
-        runner = RoutineRunner(
-            node=self,
-            client_cache=self._client_cache,
-            steps=routine,
-            context={"intent": intent, "payload": payload},
-            done_cb=lambda ok, message: self._on_routine_done(intent, ok, message),
-        )
-        runner.start()
-
-    def _on_routine_done(self, intent: str, ok: bool, message: str):
-        self._busy = False
-        self._publish_status({"state": "done", "intent": intent, "success": bool(ok), "message": message})
-        self._try_start_next()
+        self.get_logger().info(f"Command received: intent='{intent}' conf={conf}")
+        self.runner.start(str(intent))
 
 
 def main():
     rclpy.init()
-    node = OrchestratorNode()
+    node = Inspector()
+    ex = MultiThreadedExecutor(num_threads=4)
+    ex.add_node(node)
     try:
-        rclpy.spin(node)
+        ex.spin()
     finally:
+        ex.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

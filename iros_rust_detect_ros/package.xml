@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>rust_detect_ros</name>
+  <name>iros_rust_detect_ros</name>
   <version>0.0.0</version>
   <description>Rust detection node (segmentation -> bbox + overlay)</description>
 
@@ -18,7 +18,7 @@
   <exec_depend>vision_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>message_filters</exec_depend>
-  <exec_depend>rust_detect_interfaces</exec_depend>
+  <exec_depend>iros_custom_msgs</exec_depend>
 
   <test_depend>pytest</test_depend>
 

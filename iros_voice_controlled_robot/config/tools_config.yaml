@@ -3,22 +3,20 @@ language: en
 wake_word: robot
 
 intents:
-  take:
-    phrases: ['take', 'bring', 'fetch', 'give me']
-  put_back:
-    phrases: ['put back', 'return', 'place back']
-  stop:
-    phrases: ['stop', 'cancel', 'abort']
-  help:
-    phrases: ['help', 'commands']
+  # take:
+  #   phrases: ['take', 'bring', 'fetch', 'give me']
+  # put_back:
+  #   phrases: ['put back', 'return', 'place back']
+  # stop:
+  #   phrases: ['stop', 'cancel', 'abort']
+  # help:
+  #   phrases: ['help', 'commands']
   inspect:
     phrases: ["inspection", "check", "inspect"]
-
+  calibration:
+    phrases: ["calibrate", "configure"]
+  reset:
+    phrases: ["clear", "reset"]
 tools:
   # inspect: ["inspection", "check", "inspect"]
-  hammer: ['hammer', 'mallet', 'sledgehammer']
-  screwdriver: ['screwdriver', 'driver']
-  wrench: ['wrench', 'spanner']
   pliers: ['pliers']
-  drill: ['drill', 'power drill']
-

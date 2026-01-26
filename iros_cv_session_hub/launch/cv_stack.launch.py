@@ -1,10 +1,9 @@
-# cv_session_hub/launch/cv_stack.launch.py
+# iros_cv_session_hub/launch/cv_stack.launch.py
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -14,23 +13,20 @@ def generate_launch_description():
 
     rust_service = LaunchConfiguration("rust_service")
     pcb_infer_service = LaunchConfiguration("pcb_infer_service")
+    gear_infer_service = LaunchConfiguration("gear_infer_service")
 
     listen_duration_s = LaunchConfiguration("listen_duration_s")
-    republish_rate_hz = LaunchConfiguration("republish_rate_hz")
     output_prefix = LaunchConfiguration("output_prefix")
+
+    rust_service_timeout_s = LaunchConfiguration("rust_service_timeout_s")
+    pcb_service_timeout_s = LaunchConfiguration("pcb_service_timeout_s")
+    gear_service_timeout_s = LaunchConfiguration("gear_service_timeout_s")
 
     # optional debug image publisher
     use_debug_pub = LaunchConfiguration("use_debug_publisher")
     image_dir = LaunchConfiguration("image_dir")
     debug_rate_hz = LaunchConfiguration("debug_rate_hz")
     debug_loop = LaunchConfiguration("debug_loop")
-
-    # pcb params (optional override)
-    pcb_image_topic = LaunchConfiguration("pcb_image_topic")
-    pcb_model_path = LaunchConfiguration("pcb_model_path")
-    pcb_conf_thr = LaunchConfiguration("pcb_conf_thr")
-    pcb_iou_thr = LaunchConfiguration("pcb_iou_thr")
-    pcb_device = LaunchConfiguration("pcb_device")
 
     # rust params (optional override)
     rust_thr = LaunchConfiguration("rust_thr")
@@ -41,17 +37,27 @@ def generate_launch_description():
     rust_amp = LaunchConfiguration("rust_amp")
     rust_prob_vis_mode = LaunchConfiguration("rust_prob_vis_mode")
 
+    # hub input topics (configurable)
+    rust_prob_topic = LaunchConfiguration("rust_prob_topic")
+    rust_detected_topic = LaunchConfiguration("rust_detected_topic")
+
+    pcb_report_topic = LaunchConfiguration("pcb_report_topic")
+    pcb_annotated_topic = LaunchConfiguration("pcb_annotated_topic")
+
+    gear_report_topic = LaunchConfiguration("gear_report_topic")
+    gear_annotated_topic = LaunchConfiguration("gear_annotated_topic")
+
     return LaunchDescription([
         # ---------- arguments ----------
         DeclareLaunchArgument(
             "weights",
-            default_value="",
-            description="Path to rust segmentation checkpoint (.pth/.pt). Required."
+            default_value="/home/mobile/ros2_ws/src/iros_rust_detect_ros/models/speedup_l1_s0.35.pth",
+            description="Path to rust segmentation checkpoint (.pth/.pt)."
         ),
         DeclareLaunchArgument(
             "image_topic",
-            default_value="/camera/image_raw",
-            description="Camera topic for rust node (and debug publisher if used)."
+            default_value="/image_raw",
+            description="Camera topic."
         ),
 
         DeclareLaunchArgument(
@@ -64,27 +70,32 @@ def generate_launch_description():
             default_value="/pcb_inspector/inference",
             description="PCB Trigger inference service name."
         ),
+        DeclareLaunchArgument(
+            "gear_infer_service",
+            default_value="/gear_inspector/inference",
+            description="Gear Trigger inference service name."
+        ),
 
         DeclareLaunchArgument("listen_duration_s", default_value="2.0"),
-        DeclareLaunchArgument("republish_rate_hz", default_value="5.0"),
         DeclareLaunchArgument("output_prefix", default_value="/cv_hub"),
+
+        DeclareLaunchArgument("rust_service_timeout_s", default_value="10.0"),
+        DeclareLaunchArgument("pcb_service_timeout_s", default_value="10.0"),
+        DeclareLaunchArgument("gear_service_timeout_s", default_value="10.0"),
+
+        # hub input topics
+        DeclareLaunchArgument("rust_prob_topic", default_value="/rust/prob"),
+        DeclareLaunchArgument("rust_detected_topic", default_value="/rust/detected"),
+        DeclareLaunchArgument("pcb_report_topic", default_value="/pcb_inspector/report"),
+        DeclareLaunchArgument("pcb_annotated_topic", default_value="/pcb_inspector/annotated"),
+        DeclareLaunchArgument("gear_report_topic", default_value="/gear_inspector/report"),
+        DeclareLaunchArgument("gear_annotated_topic", default_value="/gear_inspector/annotated"),
 
         # debug publisher
         DeclareLaunchArgument("use_debug_publisher", default_value="false"),
         DeclareLaunchArgument("image_dir", default_value=""),
         DeclareLaunchArgument("debug_rate_hz", default_value="2.0"),
         DeclareLaunchArgument("debug_loop", default_value="true"),
-
-        # pcb overrides
-        DeclareLaunchArgument("pcb_image_topic", default_value="/camera/image_raw"),
-        # ВАЖНО: НЕ ставь default="" иначе ты затрёшь дефолтный путь в ноде и она упадёт FileNotFoundError
-        DeclareLaunchArgument(
-            "pcb_model_path",
-            default_value="/home/mobile/ros2_ws/src/iros_cv_algorithms/iros_cv_algorithms/algos/models/yolo12s-pcb.pt"
-        ),
-        DeclareLaunchArgument("pcb_conf_thr", default_value="0.25"),
-        DeclareLaunchArgument("pcb_iou_thr", default_value="0.50"),
-        DeclareLaunchArgument("pcb_device", default_value="0"),  # хотим строку "0"
 
         # rust overrides
         DeclareLaunchArgument("rust_thr", default_value="0.35"),
@@ -117,18 +128,13 @@ def generate_launch_description():
             name="pcb_inspector",
             output="screen",
             parameters=[{
-                "image_topic": pcb_image_topic,
-                "model_path": pcb_model_path,
-                "conf_thr": pcb_conf_thr,
-                "iou_thr": pcb_iou_thr,
-                # КЛЮЧЕВОЕ: принудительно строковый тип, иначе YAML сделает int
-                "device": ParameterValue(pcb_device, value_type=str),
+                "image_topic": image_topic,
             }],
         ),
 
         # ---------- Rust detector (service-driven) ----------
         Node(
-            package="rust_detect_ros",
+            package="iros_rust_detect_ros",
             executable="rust_detect_node",
             name="rust_detect_node",
             output="screen",
@@ -147,28 +153,30 @@ def generate_launch_description():
             }],
         ),
 
-        # ---------- Session hub ----------
+        # ---------- Session hub (3 run triggers + 1 publish trigger, no timer) ----------
         Node(
-            package="cv_session_hub",
-            executable="cv_session_hub",
-            name="cv_session_hub",
+            package="iros_cv_session_hub",
+            executable="iros_cv_session_hub",
+            name="iros_cv_session_hub",
             output="screen",
             parameters=[{
                 "listen_duration_s": listen_duration_s,
-                "republish_rate_hz": republish_rate_hz,
                 "output_prefix": output_prefix,
 
-                "call_rust_service": True,
-                "call_pcb_infer_service": True,
-
                 "rust_service": rust_service,
+                "rust_service_timeout_s": rust_service_timeout_s,
+                "rust_prob_topic": rust_prob_topic,
+                "rust_detected_topic": rust_detected_topic,
+
                 "pcb_infer_service": pcb_infer_service,
+                "pcb_service_timeout_s": pcb_service_timeout_s,
+                "pcb_report_topic": pcb_report_topic,
+                "pcb_annotated_topic": pcb_annotated_topic,
 
-                "rust_prob_topic": "/rust/prob",
-                "rust_detected_topic": "/rust/detected",
-
-                "pcb_report_topic": "/pcb_inspector/report",
-                "pcb_annotated_topic": "/pcb_inspector/annotated",
+                "gear_infer_service": gear_infer_service,
+                "gear_service_timeout_s": gear_service_timeout_s,
+                "gear_report_topic": gear_report_topic,
+                "gear_annotated_topic": gear_annotated_topic,
             }],
         ),
     ])
