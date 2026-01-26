@@ -210,7 +210,7 @@ class CvAlgorithmsNode(Node):
             msg.pred = []
 
         # логгер "то же самое сообщение"
-        self.get_logger().info(f"[pcb_detection] {msg}")
+        self.get_logger().info(f"[pcb_detection] Send message")
 
         self._pub_pcb.publish(msg)
 

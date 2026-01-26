@@ -297,7 +297,7 @@ class OrchestratorNode(Node):
         self._min_confidence = float(self.get_parameter("min_confidence").value)
 
         self._status_pub = self.create_publisher(String, self._status_topic, 10)
-        self._sub = self.create_subscription(String, self._voice_topic, self._on_voice_command, 10)
+        self._sub = self.create_subscription(String, self._voice_topic, self._on_iros_voice_command, 10)
 
         self._client_cache = ServiceClientCache(self)
         self._queue = deque()
@@ -460,7 +460,7 @@ class OrchestratorNode(Node):
             return {k: [self.parse_step_dict(x) for x in v["steps"]] for k, v in default_yaml_like.items()}
         return routines
 
-    def _on_voice_command(self, msg: String):
+    def _on_iros_voice_command(self, msg: String):
         try:
             payload = json.loads(msg.data)
         except Exception as e:

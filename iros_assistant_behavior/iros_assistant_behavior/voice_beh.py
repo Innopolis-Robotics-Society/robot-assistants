@@ -35,7 +35,7 @@ class VoiceCommandExecutor(Node):
     """
 
     def __init__(self):
-        super().__init__('voice_command_executor')
+        super().__init__('iros_voice_command_executor')
 
         # Параметры фреймов и поведения
         self.declare_parameters(
