@@ -29,7 +29,7 @@ setup(
             'cv_algorithms_node = iros_cv_algorithms.cv_algorithms_node:main',
             'pcb_check = iros_cv_algorithms.pcb_check:main',
             'gears_check = iros_cv_algorithms.gears_check:main',
-
+            'gear_counter = iros_cv_algorithms.gear_counter:main',
         ],
     },
 )

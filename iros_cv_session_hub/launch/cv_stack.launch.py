@@ -72,7 +72,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "gear_infer_service",
-            default_value="/gear_inspector/inference",
+            default_value="/gears_check/inference",
             description="Gear Trigger inference service name."
         ),
 
@@ -88,8 +88,8 @@ def generate_launch_description():
         DeclareLaunchArgument("rust_detected_topic", default_value="/rust/detected"),
         DeclareLaunchArgument("pcb_report_topic", default_value="/pcb_inspector/report"),
         DeclareLaunchArgument("pcb_annotated_topic", default_value="/pcb_inspector/annotated"),
-        DeclareLaunchArgument("gear_report_topic", default_value="/gear_inspector/report"),
-        DeclareLaunchArgument("gear_annotated_topic", default_value="/gear_inspector/annotated"),
+        DeclareLaunchArgument("gear_report_topic", default_value="/gears_check/report"),
+        DeclareLaunchArgument("gear_annotated_topic", default_value="/gears_check/annotated"),
 
         # debug publisher
         DeclareLaunchArgument("use_debug_publisher", default_value="false"),
