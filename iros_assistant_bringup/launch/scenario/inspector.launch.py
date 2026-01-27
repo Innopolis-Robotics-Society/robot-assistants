@@ -103,7 +103,10 @@ def generate_launch_description():
         launch_arguments=[],
     )
 
-
+    iros_text_to_speach = Node(
+        package="iros_text_to_speach",
+        executable="voice_command_node",
+    )
 
     cv_pipeline = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -156,6 +159,7 @@ def generate_launch_description():
             video_device_arg,
             tf,
             camera,
+            iros_text_to_speach,
             ur_launch,
             robopro_launch,
             cv_pipeline,
