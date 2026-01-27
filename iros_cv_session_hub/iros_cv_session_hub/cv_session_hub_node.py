@@ -54,11 +54,52 @@ def _pick_bool_from_dict(d: dict, keys: Tuple[str, ...], default: Optional[bool]
     return default
 
 
+def _pick_float_from_dict(d: dict, keys: Tuple[str, ...], default: Optional[float] = None) -> Optional[float]:
+    for k in keys:
+        if k in d:
+            v = d[k]
+            if isinstance(v, (int, float)):
+                return float(v)
+            if isinstance(v, str):
+                try:
+                    return float(v.strip())
+                except Exception:
+                    pass
+    return default
+
+
+def _pick_int_from_dict(d: dict, keys: Tuple[str, ...], default: Optional[int] = None) -> Optional[int]:
+    for k in keys:
+        if k in d:
+            v = d[k]
+            if isinstance(v, bool):
+                return int(v)
+            if isinstance(v, int):
+                return int(v)
+            if isinstance(v, float):
+                return int(v)
+            if isinstance(v, str):
+                try:
+                    return int(float(v.strip()))
+                except Exception:
+                    pass
+    return default
+
+
 # ---------------- node ----------------
 
 class CvSessionHubNode(Node):
     """
     Hub node with 3 independent "run" triggers + 1 "publish" trigger (one-shot).
+
+    Updated rust parsing for NEW rust node JSON:
+      - rust classification (ResNet decision): d["run_unet"] (bool)
+      - final detection (UNet+post): d["detected"] (bool)
+      - rust probability: d["rust_prob"] (float)
+    Select which one should be treated as "rust_detected" via param rust_detect_mode:
+      - "resnet" -> use run_unet as rust_detected (your desired behavior)
+      - "final"  -> use detected as rust_detected
+    Default is "resnet".
 
     Additional:
     - On ~/publish, publishes /<output_prefix>/ok as Bool for a short burst (few seconds),
@@ -84,6 +125,7 @@ class CvSessionHubNode(Node):
         self.declare_parameter("rust_service_timeout_s", 2.0)
         self.declare_parameter("rust_prob_topic", "/rust/prob")             # sensor_msgs/Image
         self.declare_parameter("rust_detected_topic", "/rust/detected")     # std_msgs/Bool (optional)
+        self.declare_parameter("rust_detect_mode", "resnet")                # "resnet"|"final"
 
         # pcb inputs
         self.declare_parameter("pcb_infer_service", "/pcb_inspector/inference")   # std_srvs/Trigger
@@ -123,7 +165,7 @@ class CvSessionHubNode(Node):
 
         # snapshots: rust
         self._snap_rust_prob: Optional[Image] = None
-        self._snap_rust_detected: Optional[bool] = None
+        self._snap_rust_detected: Optional[bool] = None  # per rust_detect_mode
         self._snap_rust_service: Optional[dict] = None
         self._snap_rust_report_str: str = ""
         self._snap_rust_meta: Dict[str, Any] = {}
@@ -305,7 +347,6 @@ class CvSessionHubNode(Node):
         duration_s = float(self.get_parameter("ok_burst_duration_s").value) or 0.0
         rate_hz = float(self.get_parameter("ok_burst_rate_hz").value) or 0.0
         if duration_s <= 0.0 or rate_hz <= 0.0:
-            # still publish once
             m = Bool()
             m.data = bool(value)
             self._pub_ok.publish(m)
@@ -314,7 +355,6 @@ class CvSessionHubNode(Node):
         period_s = 1.0 / max(1e-6, rate_hz)
 
         with self._ok_burst_lock:
-            # stop previous burst if any
             if self._ok_burst_timer is not None:
                 self._ok_burst_timer.cancel()
                 self._ok_burst_timer = None
@@ -322,7 +362,6 @@ class CvSessionHubNode(Node):
             self._ok_burst_value = bool(value)
             self._ok_burst_end_mono = _now_mono() + duration_s
 
-            # publish immediately
             m = Bool()
             m.data = self._ok_burst_value
             self._pub_ok.publish(m)
@@ -382,6 +421,7 @@ class CvSessionHubNode(Node):
         try:
             listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
             timeout_s = float(self.get_parameter("rust_service_timeout_s").value) or 2.0
+            detect_mode = str(self.get_parameter("rust_detect_mode").value).strip().lower() or "resnet"
 
             window_start = _now_mono()
             call_ok, call_resp, call_err = self._call_trigger(self._rust_cli, timeout_s)
@@ -394,17 +434,35 @@ class CvSessionHubNode(Node):
             rust_prob_msg = live["rust_prob"].msg if got_prob and live["rust_prob"] else None
             rust_det_from_topic = bool(live["rust_det"].msg.data) if got_det_topic and live["rust_det"] else None
 
-            rust_service_dict = None
-            rust_detected = None
-            resp_success = None
+            rust_service_dict: Optional[dict] = None
+            resp_success: Optional[bool] = None
+
+            rust_final: Optional[bool] = None      # UNet+post: d["detected"]
+            rust_resnet: Optional[bool] = None     # ResNet decision: d["run_unet"]
+            rust_prob_val: Optional[float] = None  # d["rust_prob"]
+
+            rust_detected: Optional[bool] = None   # selected per mode
 
             if call_resp is not None:
                 resp_success = bool(getattr(call_resp, "success", False))
                 msg = str(getattr(call_resp, "message", ""))
                 d = _safe_json_loads(msg)
+
                 if isinstance(d, dict):
                     rust_service_dict = d
-                    rust_detected = bool(d.get("detected", resp_success))
+
+                    rust_final = _pick_bool_from_dict(d, ("detected", "rust_detected", "final_detected"), default=None)
+                    rust_resnet = _pick_bool_from_dict(d, ("run_unet", "resnet_detected", "rust_pred"), default=None)
+                    rust_prob_val = _pick_float_from_dict(d, ("rust_prob", "prob", "score"), default=None)
+
+                    if detect_mode == "final":
+                        rust_detected = rust_final if rust_final is not None else rust_resnet
+                    else:
+                        # default: resnet
+                        rust_detected = rust_resnet if rust_resnet is not None else rust_final
+
+                    if rust_detected is None:
+                        rust_detected = resp_success
                 else:
                     rust_service_dict = {"raw_message": msg}
                     rust_detected = resp_success
@@ -412,8 +470,24 @@ class CvSessionHubNode(Node):
                 rust_service_dict = None
                 rust_detected = None
 
+            # fallback to topic if still unknown
             if rust_detected is None:
                 rust_detected = rust_det_from_topic
+
+            # detected source
+            detected_source = None
+            if rust_detected is not None:
+                if call_resp is not None and isinstance(rust_service_dict, dict) and rust_service_dict is not None:
+                    if "detected" in rust_service_dict or "run_unet" in rust_service_dict:
+                        detected_source = f"service_json:{detect_mode}"
+                    else:
+                        detected_source = "service_unknown_json"
+                elif call_resp is not None:
+                    detected_source = "service_success_fallback"
+                elif got_det_topic:
+                    detected_source = "topic"
+                else:
+                    detected_source = "unknown"
 
             topic_meta = {"got_rust_prob": bool(got_prob), "got_rust_detected_topic": bool(got_det_topic)}
             meta = {
@@ -421,19 +495,22 @@ class CvSessionHubNode(Node):
                 "service_timeout_s": timeout_s,
                 "service_error": call_err,
                 "service_call_ok": bool(call_ok),
+                "rust_detect_mode": detect_mode,
                 **topic_meta,
             }
-
-            detected_source = None
-            if rust_detected is not None:
-                detected_source = "service" if call_resp is not None else "topic"
 
             rust_report_str = self._compose_check_report(
                 "rust",
                 call_ok, call_err, resp_success,
                 rust_service_dict,
                 topic_meta,
-                {"detected": rust_detected, "detected_source": detected_source},
+                {
+                    "detected": rust_detected,
+                    "detected_source": detected_source,
+                    "service_final_detected": rust_final,
+                    "service_resnet_detected": rust_resnet,
+                    "service_rust_prob": rust_prob_val,
+                },
             )
 
             with self._snap_lock:
@@ -607,7 +684,6 @@ class CvSessionHubNode(Node):
             combined = self._compose_combined_report_locked()
             self._snap_combined_report_str = combined
 
-        # publish snapshots
         if rust_prob is not None:
             self._pub_rust_prob.publish(rust_prob)
         if rust_det is not None:
@@ -641,10 +717,8 @@ class CvSessionHubNode(Node):
             s.data = gear_rep
             self._pub_gear_rep.publish(s)
 
-        # /ok burst for a few seconds
         self._start_ok_burst(global_ok)
 
-        # combined report
         s = String()
         s.data = combined
         self._pub_report.publish(s)
