@@ -58,16 +58,20 @@ def _pick_bool_from_dict(d: dict, keys: Tuple[str, ...], default: Optional[bool]
 
 class CvSessionHubNode(Node):
     """
-    Hub node with 3 independent "run" triggers + 1 "publish" trigger.
+    Hub node with 3 independent "run" triggers + 1 "publish" trigger (one-shot).
 
-    - ~/run_rust : always calls rust Trigger service, then listens for listen_duration_s, snapshots fresh rust topics
-    - ~/run_pcb  : always calls pcb Trigger service, then listens for listen_duration_s, snapshots fresh pcb topics
-    - ~/run_gear : always calls gear Trigger service, then listens for listen_duration_s, snapshots fresh gear topics
-    - ~/publish  : publishes stored snapshots ONCE (no timer), returns combined report JSON
+    - ~/run_rust : ALWAYS calls rust Trigger service, then listens for listen_duration_s,
+                  snapshots fresh rust topics.
+    - ~/run_pcb  : ALWAYS calls pcb Trigger service, then listens for listen_duration_s,
+                  snapshots fresh pcb topics.
+    - ~/run_gear : ALWAYS calls gear Trigger service, then listens for listen_duration_s,
+                  snapshots fresh gear topics.
+    - ~/publish  : publishes stored snapshots ONCE (no timer) and returns combined report JSON.
 
-    Notes:
-    - This node does NOT start checks automatically; every check is started only via its run_* trigger.
-    - Publishing is also only done via ~/publish trigger (one-shot).
+    Additional:
+    - Publishes /<output_prefix>/ok as Bool on ~/publish:
+        ok = (rust_detected == False) AND (pcb_ok == True) AND (gear_ok == True)
+      Otherwise ok = False.
     """
 
     def __init__(self) -> None:
@@ -86,16 +90,16 @@ class CvSessionHubNode(Node):
         self.declare_parameter("rust_detected_topic", "/rust/detected")     # std_msgs/Bool (optional)
 
         # pcb inputs
-        self.declare_parameter("pcb_infer_service", "/pcb_inspector/inference")  # std_srvs/Trigger
+        self.declare_parameter("pcb_infer_service", "/pcb_inspector/inference")   # std_srvs/Trigger
         self.declare_parameter("pcb_service_timeout_s", 3.0)
-        self.declare_parameter("pcb_report_topic", "/pcb_inspector/report")      # std_msgs/String(JSON)
-        self.declare_parameter("pcb_annotated_topic", "/pcb_inspector/annotated")# sensor_msgs/Image
+        self.declare_parameter("pcb_report_topic", "/pcb_inspector/report")       # std_msgs/String(JSON)
+        self.declare_parameter("pcb_annotated_topic", "/pcb_inspector/annotated") # sensor_msgs/Image
 
-        # gear inputs (same pattern)
-        self.declare_parameter("gear_infer_service", "/gear_inspector/inference") # std_srvs/Trigger
+        # gear inputs
+        self.declare_parameter("gear_infer_service", "/gear_inspector/inference")   # std_srvs/Trigger
         self.declare_parameter("gear_service_timeout_s", 3.0)
-        self.declare_parameter("gear_report_topic", "/gear_inspector/report")      # std_msgs/String(JSON)
-        self.declare_parameter("gear_annotated_topic", "/gear_inspector/annotated")# sensor_msgs/Image
+        self.declare_parameter("gear_report_topic", "/gear_inspector/report")       # std_msgs/String(JSON)
+        self.declare_parameter("gear_annotated_topic", "/gear_inspector/annotated") # sensor_msgs/Image
 
         # -------- locks/state --------
         self._live_lock = threading.Lock()
@@ -161,8 +165,9 @@ class CvSessionHubNode(Node):
         self._pub_gear_ok = self.create_publisher(Bool, f"{out_prefix}/gear/ok", 10)
         self._pub_gear_rep = self.create_publisher(String, f"{out_prefix}/gear/report", 10)
 
-        # combined
+        # combined + global ok
         self._pub_report = self.create_publisher(String, f"{out_prefix}/report", 10)
+        self._pub_ok = self.create_publisher(Bool, f"{out_prefix}/ok", 10)
 
         # Subscribers
         self.create_subscription(
@@ -214,10 +219,10 @@ class CvSessionHubNode(Node):
         self._gear_cli = self.create_client(Trigger, str(self.get_parameter("gear_infer_service").value), callback_group=self._cbg)
 
         # Service servers
-        self._srv_run_rust = self.create_service(Trigger, "~/run_rust", self._on_run_rust, callback_group=self._cbg)
-        self._srv_run_pcb = self.create_service(Trigger, "~/run_pcb", self._on_run_pcb, callback_group=self._cbg)
-        self._srv_run_gear = self.create_service(Trigger, "~/run_gear", self._on_run_gear, callback_group=self._cbg)
-        self._srv_publish = self.create_service(Trigger, "~/publish", self._on_publish, callback_group=self._cbg)
+        self.create_service(Trigger, "~/run_rust", self._on_run_rust, callback_group=self._cbg)
+        self.create_service(Trigger, "~/run_pcb", self._on_run_pcb, callback_group=self._cbg)
+        self.create_service(Trigger, "~/run_gear", self._on_run_gear, callback_group=self._cbg)
+        self.create_service(Trigger, "~/publish", self._on_publish, callback_group=self._cbg)
 
         self.get_logger().info(
             f"{self.get_name()} ready. Services: ~/(run_rust, run_pcb, run_gear, publish). "
@@ -295,7 +300,8 @@ class CvSessionHubNode(Node):
                 "gear_report": self._live_gear_report,
             }
 
-    def _is_fresh(self, tm: Optional[TimedMsg], window_start_mono: float) -> bool:
+    @staticmethod
+    def _is_fresh(tm: Optional[TimedMsg], window_start_mono: float) -> bool:
         return bool(tm and tm.t_mono >= window_start_mono)
 
     def _compose_check_report(
@@ -324,10 +330,17 @@ class CvSessionHubNode(Node):
         }
         return json.dumps(out, ensure_ascii=False)
 
+    def _compute_global_ok(self, rust_detected: Optional[bool], pcb_ok: Optional[bool], gear_ok: Optional[bool]) -> bool:
+        # Strictly matches requirement: Rust==False AND PCB==True AND Gear==True
+        return (rust_detected is False) and (pcb_ok is True) and (gear_ok is True)
+
     def _compose_combined_report_locked(self) -> str:
         """Assumes _snap_lock is held."""
         ts = time.time()
+        global_ok = self._compute_global_ok(self._snap_rust_detected, self._snap_pcb_ok, self._snap_gear_ok)
+
         out = {
+            "ok": global_ok,
             "rust": {
                 "detected": self._snap_rust_detected,
                 "service_data": self._snap_rust_service,
@@ -365,21 +378,18 @@ class CvSessionHubNode(Node):
             listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
             timeout_s = float(self.get_parameter("rust_service_timeout_s").value) or 2.0
 
-            # Always call service first
-            call_start = _now_mono()
+            window_start = _now_mono()
             call_ok, call_resp, call_err = self._call_trigger(self._rust_cli, timeout_s)
 
-            # Always listen after service call (but accept messages during call as "fresh")
             self._sleep_listen_window(listen_s)
 
             live = self._copy_live()
-            got_prob = self._is_fresh(live["rust_prob"], call_start)
-            got_det_topic = self._is_fresh(live["rust_det"], call_start)
+            got_prob = self._is_fresh(live["rust_prob"], window_start)
+            got_det_topic = self._is_fresh(live["rust_det"], window_start)
 
             rust_prob_msg = live["rust_prob"].msg if got_prob and live["rust_prob"] else None
             rust_det_from_topic = bool(live["rust_det"].msg.data) if got_det_topic and live["rust_det"] else None
 
-            # Parse service response
             rust_service_dict = None
             rust_detected = None
             resp_success = None
@@ -417,12 +427,13 @@ class CvSessionHubNode(Node):
                 **topic_meta,
             }
 
+            detected_source = None
+            if rust_detected is not None:
+                detected_source = "service" if call_resp is not None else "topic"
+
             result_fields = {
                 "detected": rust_detected,
-                "detected_source": (
-                    "service" if rust_detected is not None and call_resp is not None else
-                    ("topic" if rust_detected is not None else None)
-                ),
+                "detected_source": detected_source,
             }
 
             rust_report_str = self._compose_check_report(
@@ -444,7 +455,6 @@ class CvSessionHubNode(Node):
                 self._snap_rust_meta = meta
                 self._snap_rust_last_ts_unix = time.time()
 
-            # success criteria: service must complete and we must have some result
             have_any = bool(call_resp is not None or got_prob or got_det_topic)
             res.success = bool(call_ok and have_any)
             res.message = rust_report_str
@@ -463,14 +473,14 @@ class CvSessionHubNode(Node):
             listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
             timeout_s = float(self.get_parameter("pcb_service_timeout_s").value) or 3.0
 
-            call_start = _now_mono()
+            window_start = _now_mono()
             call_ok, call_resp, call_err = self._call_trigger(self._pcb_cli, timeout_s)
 
             self._sleep_listen_window(listen_s)
 
             live = self._copy_live()
-            got_annot = self._is_fresh(live["pcb_annot"], call_start)
-            got_report = self._is_fresh(live["pcb_report"], call_start)
+            got_annot = self._is_fresh(live["pcb_annot"], window_start)
+            got_report = self._is_fresh(live["pcb_report"], window_start)
 
             pcb_annot_msg = live["pcb_annot"].msg if got_annot and live["pcb_annot"] else None
             pcb_report_msg = live["pcb_report"].msg if got_report and live["pcb_report"] else None
@@ -484,7 +494,7 @@ class CvSessionHubNode(Node):
 
             resp_success = bool(getattr(call_resp, "success", False)) if call_resp is not None else None
             svc_msg_dict = _safe_json_loads(str(getattr(call_resp, "message", ""))) if call_resp is not None else None
-            if not isinstance(svc_msg_dict, dict) and call_resp is not None:
+            if call_resp is not None and not isinstance(svc_msg_dict, dict):
                 svc_msg_dict = {"raw_message": str(getattr(call_resp, "message", ""))}
 
             topic_meta = {
@@ -541,14 +551,14 @@ class CvSessionHubNode(Node):
             listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
             timeout_s = float(self.get_parameter("gear_service_timeout_s").value) or 3.0
 
-            call_start = _now_mono()
+            window_start = _now_mono()
             call_ok, call_resp, call_err = self._call_trigger(self._gear_cli, timeout_s)
 
             self._sleep_listen_window(listen_s)
 
             live = self._copy_live()
-            got_annot = self._is_fresh(live["gear_annot"], call_start)
-            got_report = self._is_fresh(live["gear_report"], call_start)
+            got_annot = self._is_fresh(live["gear_annot"], window_start)
+            got_report = self._is_fresh(live["gear_report"], window_start)
 
             gear_annot_msg = live["gear_annot"].msg if got_annot and live["gear_annot"] else None
             gear_report_msg = live["gear_report"].msg if got_report and live["gear_report"] else None
@@ -562,7 +572,7 @@ class CvSessionHubNode(Node):
 
             resp_success = bool(getattr(call_resp, "success", False)) if call_resp is not None else None
             svc_msg_dict = _safe_json_loads(str(getattr(call_resp, "message", ""))) if call_resp is not None else None
-            if not isinstance(svc_msg_dict, dict) and call_resp is not None:
+            if call_resp is not None and not isinstance(svc_msg_dict, dict):
                 svc_msg_dict = {"raw_message": str(getattr(call_resp, "message", ""))}
 
             topic_meta = {
@@ -611,7 +621,7 @@ class CvSessionHubNode(Node):
 
     # -------- service: publish (one-shot) --------
 
-    def _publish_snapshot_once(self) -> str:
+    def _publish_snapshot_once(self) -> Tuple[str, bool]:
         with self._snap_lock:
             rust_prob = self._snap_rust_prob
             rust_det = self._snap_rust_detected
@@ -625,6 +635,7 @@ class CvSessionHubNode(Node):
             gear_ok = self._snap_gear_ok
             gear_rep = self._snap_gear_report_str
 
+            global_ok = self._compute_global_ok(rust_det, pcb_ok, gear_ok)
             combined = self._compose_combined_report_locked()
             self._snap_combined_report_str = combined
 
@@ -664,18 +675,22 @@ class CvSessionHubNode(Node):
             s.data = gear_rep
             self._pub_gear_rep.publish(s)
 
-        # combined
+        # global ok
+        ok_msg = Bool()
+        ok_msg.data = bool(global_ok)
+        self._pub_ok.publish(ok_msg)
+
+        # combined report
         s = String()
         s.data = combined
         self._pub_report.publish(s)
 
-        return combined
+        return combined, global_ok
 
     def _on_publish(self, _req: Trigger.Request, res: Trigger.Response) -> Trigger.Response:
-        combined = self._publish_snapshot_once()
+        combined, _global_ok = self._publish_snapshot_once()
 
         d = _safe_json_loads(combined) or {}
-        # success if there is at least one non-empty check report stored
         have_any = bool(
             (d.get("rust", {}).get("last_ts_unix") is not None)
             or (d.get("pcb", {}).get("last_ts_unix") is not None)

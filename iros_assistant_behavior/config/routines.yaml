@@ -48,7 +48,7 @@ routines:
         delay_after_sec: 0.5
 
       - type: wait_topic
-        topic_name: /cv_hub/result/summary
+        topic_name: /cv_hub/ok
         topic_type: std_msgs/msg/Bool
         store_as: cv_ok
         timeout_sec: 15.0

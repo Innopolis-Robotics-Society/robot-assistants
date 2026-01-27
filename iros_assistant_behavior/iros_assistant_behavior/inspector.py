@@ -1,429 +1,675 @@
 #!/usr/bin/env python3
-import importlib
+from __future__ import annotations
+
 import json
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, List
-
-import yaml
+from typing import Any, Dict, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data
 
-from std_msgs.msg import String
-
-
-# ROS2: set_message_fields находится тут
-try:
-    from rosidl_runtime_py.set_message import set_message_fields  # type: ignore
-except Exception:
-    # fallback (упрощённый)
-    def set_message_fields(msg: Any, values: Dict[str, Any], strict_mode: bool = False) -> None:
-        for k, v in values.items():
-            if hasattr(msg, k):
-                setattr(msg, k, v)
+from std_srvs.srv import Trigger
+from std_msgs.msg import Bool, String
+from sensor_msgs.msg import Image
 
 
-def _import_srv(type_str: str):
-    # "pkg/srv/Name"
-    parts = type_str.split("/")
-    if len(parts) != 3 or parts[1] != "srv":
-        raise ValueError(f"Bad service_type '{type_str}', expected 'pkg/srv/Name'")
-    pkg, _, name = parts
-    mod = importlib.import_module(f"{pkg}.srv")
-    return getattr(mod, name)
+# ---------------- small utils ----------------
+
+@dataclass
+class TimedMsg:
+    msg: Any
+    t_mono: float  # time.monotonic() at receipt
 
 
-def _import_msg(type_str: str):
-    # "pkg/msg/Name"
-    parts = type_str.split("/")
-    if len(parts) != 3 or parts[1] != "msg":
-        raise ValueError(f"Bad topic_type '{type_str}', expected 'pkg/msg/Name'")
-    pkg, _, name = parts
-    mod = importlib.import_module(f"{pkg}.msg")
-    return getattr(mod, name)
-
-
-def _now() -> float:
+def _now_mono() -> float:
     return time.monotonic()
 
 
-def _as_bool(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "yes", "y", "ok")
-    return bool(v)
-
-
-@dataclass
-class ActiveWaitTopic:
-    topic: str
-    started_at: float
-    timeout: float
-    store_as: str
-
-
-@dataclass
-class ActiveServiceCall:
-    service_name: str
-    started_at: float
-    timeout: float
-    future: Any
-    store_as: Optional[str] = None
-
-
-@dataclass
-class ActiveSleep:
-    until: float
-
-
-class RoutineRunner:
-    def __init__(self, node: Node):
-        self.node = node
-        self.cb_group = ReentrantCallbackGroup()
-
-        self.routines: Dict[str, Any] = {}
-        self.ctx: Dict[str, Any] = {}
-
-        self._steps: List[Dict[str, Any]] = []
-        self._ip: int = 0
-        self._running: bool = False
-        self._routine_name: str = ""
-
-        self._active_wait_topic: Optional[ActiveWaitTopic] = None
-        self._active_service: Optional[ActiveServiceCall] = None
-        self._active_sleep: Optional[ActiveSleep] = None
-        self._waiting_until: float = 0.0
-
-        self._clients: Dict[str, Any] = {}
-        self._subs: Dict[str, Any] = {}
-
-    def load_from_file(self, path: str) -> None:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        routines = data.get("routines", data)
-        if not isinstance(routines, dict):
-            raise ValueError("routines.yaml: expected dict at top-level or in key 'routines'")
-        self.routines = routines
-        self.node.get_logger().info(f"Loaded routines: {list(self.routines.keys())} (file={path})")
-
-    @property
-    def busy(self) -> bool:
-        return self._running
-
-    def start(self, name: str) -> None:
-        if self._running:
-            self.node.get_logger().warn(f"Busy with '{self._routine_name}', ignore new routine '{name}'")
-            return
-
-        routine = self.routines.get(name)
-        if routine is None:
-            self.node.get_logger().warn(f"Unknown routine '{name}'. Available: {list(self.routines.keys())}")
-            return
-
-        steps = routine.get("steps", [])
-        if not isinstance(steps, list) or len(steps) == 0:
-            self.node.get_logger().warn(f"Routine '{name}' has no steps")
-            return
-
-        self.ctx = {}
-        self._steps = steps
-        self._ip = 0
-        self._running = True
-        self._routine_name = name
-
-        self._active_wait_topic = None
-        self._active_service = None
-        self._active_sleep = None
-        self._waiting_until = 0.0
-
-        self.node.get_logger().info(f"Start routine '{name}', steps={len(steps)}")
-
-    def _finish_step(self) -> None:
-        delay_global = float(self.node.get_parameter("post_step_delay_sec").value)
-        delay_after = 0.0
-
-        step = self._steps[self._ip]
-        if isinstance(step, dict):
-            delay_after = float(step.get("delay_after_sec", 0.0) or 0.0)
-
-        self._waiting_until = _now() + delay_global + delay_after
-        self._ip += 1
-
-        self._active_wait_topic = None
-        self._active_service = None
-        self._active_sleep = None
-
-    def _abort(self, reason: str) -> None:
-        self.node.get_logger().error(f"Routine '{self._routine_name}' aborted: {reason}")
-        self._running = False
-
-        # cleanup wait subscriptions
-        for key, sub in list(self._subs.items()):
-            try:
-                self.node.destroy_subscription(sub)
-            except Exception:
-                pass
-            self._subs.pop(key, None)
-
-        self._active_wait_topic = None
-        self._active_service = None
-        self._active_sleep = None
-
-    def _get_client(self, service_name: str, srv_type: str):
-        key = f"{service_name}|{srv_type}"
-        if key in self._clients:
-            return self._clients[key]
-        srv_cls = _import_srv(srv_type)
-        client = self.node.create_client(srv_cls, service_name, callback_group=self.cb_group)
-        self._clients[key] = client
-        return client
-
-    def _wait_topic_cb(self, store_as: str, sub_key: str, msg: Any) -> None:
-        # сохраняем "msg.data" если есть, иначе весь msg
-        val = getattr(msg, "data", msg)
-        self.ctx[store_as] = val
-        self.node.get_logger().info(f"[wait_topic] got {sub_key}: {val}")
-
-        sub = self._subs.pop(sub_key, None)
-        if sub is not None:
-            try:
-                self.node.destroy_subscription(sub)
-            except Exception:
-                pass
-
-        self._active_wait_topic = None
-        self._finish_step()
-
-    def tick(self) -> None:
-        if not self._running:
-            return
-
-        t = _now()
-        if t < self._waiting_until:
-            return
-
-        if self._ip >= len(self._steps):
-            self.node.get_logger().info(f"Routine '{self._routine_name}' finished OK")
-            self._running = False
-            return
-
-        step = self._steps[self._ip]
-        if not isinstance(step, dict):
-            self._abort(f"step {self._ip} must be dict, got {type(step)}")
-            return
-
-        stype = step.get("type")
-        if stype is None:
-            self._abort(f"step {self._ip} has no 'type'")
-            return
-
-        # --- ACTIVE: service ---
-        if self._active_service is not None:
-            if t - self._active_service.started_at > self._active_service.timeout:
-                self._abort(f"service timeout: {self._active_service.service_name}")
-                return
-            if self._active_service.future.done():
-                try:
-                    resp = self._active_service.future.result()
-                except Exception as e:
-                    self._abort(f"service exception: {self._active_service.service_name}: {e}")
-                    return
-
-                # если есть поле success и оно False — считаем провалом (для GoToFrame/GripperAction)
-                if hasattr(resp, "success") and (resp.success is False):
-                    msg = getattr(resp, "message", "")
-                    if bool(self.node.get_parameter("abort_on_failure").value):
-                        self._abort(f"{self._active_service.service_name} returned success=False: {msg}")
-                        return
-                    self.node.get_logger().warn(
-                        f"{self._active_service.service_name} returned success=False: {msg} (continue)"
-                    )
-
-                if self._active_service.store_as:
-                    self.ctx[self._active_service.store_as] = resp
-
-                # лог (короткий)
-                m = getattr(resp, "message", None)
-                if isinstance(m, str) and len(m) > 200:
-                    m = m[:200] + "..."
-                if m is not None:
-                    self.node.get_logger().info(f"[service] {self._active_service.service_name} message={m}")
-
-                self._finish_step()
-            return
-
-        # --- ACTIVE: wait_topic ---
-        if self._active_wait_topic is not None:
-            if t - self._active_wait_topic.started_at > self._active_wait_topic.timeout:
-                self._abort(f"wait_topic timeout: {self._active_wait_topic.topic}")
-            return
-
-        # --- ACTIVE: sleep ---
-        if self._active_sleep is not None:
-            if t >= self._active_sleep.until:
-                self._finish_step()
-            return
-
-        # --- START step ---
-        if stype == "sleep":
-            dur = float(step.get("duration_sec", 0.0))
-            self.node.get_logger().info(f"[step {self._ip}] sleep {dur}s")
-            self._active_sleep = ActiveSleep(until=t + dur)
-            return
-
-        if stype == "service":
-            service_name = str(step["service_name"])
-            srv_type = str(step["service_type"])
-            req_dict = step.get("request", {}) or {}
-
-            timeout = step.get("service_timeout_sec", None)
-            if timeout is None:
-                timeout = float(self.node.get_parameter("default_service_timeout_sec").value)
-            timeout = float(timeout)
-
-            store_as = step.get("store_as", None)
-
-            client = self._get_client(service_name, srv_type)
-            if not client.service_is_ready():
-                # не блокируемся — ждём готовности
-                # (таймаут считаем от момента "начала шага")
-                self.node.get_logger().info(f"[step {self._ip}] wait service {service_name} ...")
-                # имитируем активный сервис-стейт без future, чтобы отлавливать таймаут
-                dummy_future = rclpy.task.Future()
-                self._active_service = ActiveServiceCall(
-                    service_name=service_name, started_at=t, timeout=timeout, future=dummy_future
-                )
-                # но future не завершится; поэтому перепишем логику: как только сервис появится — стартанём заново
-                # (упрощение: сбросим active_service и попробуем снова в следующем tick)
-                self._active_service = None
-                self._waiting_until = t + 0.1
-                return
-
-            srv_cls = _import_srv(srv_type)
-            req = srv_cls.Request()
-            if isinstance(req_dict, dict) and len(req_dict) > 0:
-                set_message_fields(req, req_dict, False)
-
-            self.node.get_logger().info(f"[step {self._ip}] call {service_name} {srv_type} req={req_dict}")
-            future = client.call_async(req)
-            self._active_service = ActiveServiceCall(
-                service_name=service_name,
-                started_at=t,
-                timeout=timeout,
-                future=future,
-                store_as=store_as,
-            )
-            return
-
-        if stype == "wait_topic":
-            topic = str(step["topic_name"])
-            topic_type = str(step["topic_type"])
-            store_as = str(step.get("store_as", "topic_value"))
-            timeout = float(step.get("timeout_sec", 10.0))
-
-            msg_cls = _import_msg(topic_type)
-
-            sub_key = f"{topic}|{topic_type}|{store_as}"
-            if sub_key not in self._subs:
-                self.node.get_logger().info(f"[step {self._ip}] wait topic {topic} ({topic_type}) -> {store_as}")
-                sub = self.node.create_subscription(
-                    msg_cls,
-                    topic,
-                    lambda msg, _sa=store_as, _k=sub_key: self._wait_topic_cb(_sa, _k, msg),
-                    10,
-                    callback_group=self.cb_group,
-                )
-                self._subs[sub_key] = sub
-
-            self._active_wait_topic = ActiveWaitTopic(topic=topic, started_at=t, timeout=timeout, store_as=store_as)
-            return
-
-        if stype == "branch":
-            var = str(step["var"])
-            cases = step.get("cases", {}) or {}
-            val = self.ctx.get(var, False)
-            b = _as_bool(val)
-
-            # YAML "true/false" могут стать bool-ключами True/False
-            selected = None
-            if b in cases:
-                selected = cases[b]
-            else:
-                selected = cases.get("true" if b else "false")
-
-            if selected is None:
-                self._abort(f"branch: no case for {b} in var '{var}'")
-                return
-            if not isinstance(selected, list):
-                self._abort("branch: case must be list of steps")
-                return
-
-            self.node.get_logger().info(f"[step {self._ip}] branch var='{var}' -> {b}, insert {len(selected)} steps")
-
-            # заменяем текущий branch на выбранные шаги
-            self._steps = self._steps[: self._ip] + selected + self._steps[self._ip + 1 :]
-            return
-
-        self._abort(f"Unknown step type '{stype}' at step {self._ip}")
-
-
-class Inspector(Node):
-    def __init__(self):
-        super().__init__("inspector")
-
-        self.declare_parameter("routines_file", "")
-        self.declare_parameter("min_confidence", 50.0)
-        self.declare_parameter("command_topic", "/voice/command")
-
-        self.declare_parameter("post_step_delay_sec", 0.0)          # общий delay после каждого шага
-        self.declare_parameter("default_service_timeout_sec", 30.0) # если в шаге не задано
-        self.declare_parameter("abort_on_failure", True)
-
-        self.runner = RoutineRunner(self)
-
-        routines_file = str(self.get_parameter("routines_file").value)
-        if not routines_file:
-            raise RuntimeError("Parameter 'routines_file' is empty")
-
-        self.runner.load_from_file(routines_file)
-
-        topic = str(self.get_parameter("command_topic").value)
-        self.sub_cmd = self.create_subscription(String, topic, self._on_cmd, 10)
-
-        self.timer = self.create_timer(0.05, self.runner.tick)  # 20 Hz
-
-    def _on_cmd(self, msg: String) -> None:
+def _safe_json_loads(s: str) -> Optional[dict]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _pick_bool_from_dict(d: dict, keys: Tuple[str, ...], default: Optional[bool] = None) -> Optional[bool]:
+    for k in keys:
+        if k in d:
+            v = d[k]
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return bool(v)
+            if isinstance(v, str):
+                vl = v.strip().lower()
+                if vl in ("true", "1", "yes", "y", "ok", "pass", "passed", "success"):
+                    return True
+                if vl in ("false", "0", "no", "n", "fail", "failed", "error"):
+                    return False
+    return default
+
+
+# ---------------- node ----------------
+
+class CvSessionHubNode(Node):
+    """
+    Hub node with 3 independent "run" triggers + 1 "publish" trigger (one-shot).
+
+    Additional:
+    - On ~/publish, publishes /<output_prefix>/ok as Bool for a short burst (few seconds),
+      so downstream nodes can catch it.
+        ok = (rust_detected == False) AND (pcb_ok == True) AND (gear_ok == True)
+    """
+
+    def __init__(self) -> None:
+        super().__init__("iros_cv_session_hub")
+
+        self._cbg = ReentrantCallbackGroup()
+
+        # -------- params --------
+        self.declare_parameter("listen_duration_s", 2.0)
+        self.declare_parameter("output_prefix", "/cv_hub")
+
+        # ok burst publishing
+        self.declare_parameter("ok_burst_duration_s", 2.0)  # publish /ok for this many seconds
+        self.declare_parameter("ok_burst_rate_hz", 10.0)    # publish frequency during burst
+
+        # rust inputs
+        self.declare_parameter("rust_service", "/rust_detect/run")          # std_srvs/Trigger
+        self.declare_parameter("rust_service_timeout_s", 2.0)
+        self.declare_parameter("rust_prob_topic", "/rust/prob")             # sensor_msgs/Image
+        self.declare_parameter("rust_detected_topic", "/rust/detected")     # std_msgs/Bool (optional)
+
+        # pcb inputs
+        self.declare_parameter("pcb_infer_service", "/pcb_inspector/inference")   # std_srvs/Trigger
+        self.declare_parameter("pcb_service_timeout_s", 3.0)
+        self.declare_parameter("pcb_report_topic", "/pcb_inspector/report")       # std_msgs/String(JSON)
+        self.declare_parameter("pcb_annotated_topic", "/pcb_inspector/annotated") # sensor_msgs/Image
+
+        # gear inputs
+        self.declare_parameter("gear_infer_service", "/gear_inspector/inference")   # std_srvs/Trigger
+        self.declare_parameter("gear_service_timeout_s", 3.0)
+        self.declare_parameter("gear_report_topic", "/gear_inspector/report")       # std_msgs/String(JSON)
+        self.declare_parameter("gear_annotated_topic", "/gear_inspector/annotated") # sensor_msgs/Image
+
+        # -------- locks/state --------
+        self._live_lock = threading.Lock()
+        self._snap_lock = threading.Lock()
+
+        self._run_lock_rust = threading.Lock()
+        self._run_lock_pcb = threading.Lock()
+        self._run_lock_gear = threading.Lock()
+
+        # ok burst state
+        self._ok_burst_lock = threading.Lock()
+        self._ok_burst_timer = None
+        self._ok_burst_end_mono: float = 0.0
+        self._ok_burst_value: bool = False
+
+        # live buffers
+        self._live_rust_prob: Optional[TimedMsg] = None
+        self._live_rust_detected: Optional[TimedMsg] = None
+
+        self._live_pcb_annot: Optional[TimedMsg] = None
+        self._live_pcb_report: Optional[TimedMsg] = None
+
+        self._live_gear_annot: Optional[TimedMsg] = None
+        self._live_gear_report: Optional[TimedMsg] = None
+
+        # snapshots: rust
+        self._snap_rust_prob: Optional[Image] = None
+        self._snap_rust_detected: Optional[bool] = None
+        self._snap_rust_service: Optional[dict] = None
+        self._snap_rust_report_str: str = ""
+        self._snap_rust_meta: Dict[str, Any] = {}
+        self._snap_rust_last_ts_unix: Optional[float] = None
+
+        # snapshots: pcb
+        self._snap_pcb_annot: Optional[Image] = None
+        self._snap_pcb_ok: Optional[bool] = None
+        self._snap_pcb_report: Optional[dict] = None
+        self._snap_pcb_report_str: str = ""
+        self._snap_pcb_meta: Dict[str, Any] = {}
+        self._snap_pcb_last_ts_unix: Optional[float] = None
+
+        # snapshots: gear
+        self._snap_gear_annot: Optional[Image] = None
+        self._snap_gear_ok: Optional[bool] = None
+        self._snap_gear_report: Optional[dict] = None
+        self._snap_gear_report_str: str = ""
+        self._snap_gear_meta: Dict[str, Any] = {}
+        self._snap_gear_last_ts_unix: Optional[float] = None
+
+        self._snap_combined_report_str: str = ""
+
+        # -------- I/O --------
+        out_prefix = str(self.get_parameter("output_prefix").value).rstrip("/") or "/cv_hub"
+
+        # Publishers (one-shot publish via ~/publish)
+        self._pub_rust_prob = self.create_publisher(Image, f"{out_prefix}/rust/prob", qos_profile_sensor_data)
+        self._pub_rust_det = self.create_publisher(Bool, f"{out_prefix}/rust/detected", 10)
+        self._pub_rust_rep = self.create_publisher(String, f"{out_prefix}/rust/report", 10)
+
+        self._pub_pcb_annot = self.create_publisher(Image, f"{out_prefix}/pcb/annotated", qos_profile_sensor_data)
+        self._pub_pcb_ok = self.create_publisher(Bool, f"{out_prefix}/pcb/ok", 10)
+        self._pub_pcb_rep = self.create_publisher(String, f"{out_prefix}/pcb/report", 10)
+
+        self._pub_gear_annot = self.create_publisher(Image, f"{out_prefix}/gear/annotated", qos_profile_sensor_data)
+        self._pub_gear_ok = self.create_publisher(Bool, f"{out_prefix}/gear/ok", 10)
+        self._pub_gear_rep = self.create_publisher(String, f"{out_prefix}/gear/report", 10)
+
+        self._pub_report = self.create_publisher(String, f"{out_prefix}/report", 10)
+        self._pub_ok = self.create_publisher(Bool, f"{out_prefix}/ok", 10)
+
+        # Subscribers
+        self.create_subscription(
+            Image, str(self.get_parameter("rust_prob_topic").value), self._on_rust_prob,
+            qos_profile_sensor_data, callback_group=self._cbg
+        )
+        self.create_subscription(
+            Bool, str(self.get_parameter("rust_detected_topic").value), self._on_rust_detected,
+            10, callback_group=self._cbg
+        )
+        self.create_subscription(
+            Image, str(self.get_parameter("pcb_annotated_topic").value), self._on_pcb_annot,
+            qos_profile_sensor_data, callback_group=self._cbg
+        )
+        self.create_subscription(
+            String, str(self.get_parameter("pcb_report_topic").value), self._on_pcb_report,
+            10, callback_group=self._cbg
+        )
+        self.create_subscription(
+            Image, str(self.get_parameter("gear_annotated_topic").value), self._on_gear_annot,
+            qos_profile_sensor_data, callback_group=self._cbg
+        )
+        self.create_subscription(
+            String, str(self.get_parameter("gear_report_topic").value), self._on_gear_report,
+            10, callback_group=self._cbg
+        )
+
+        # Service clients
+        self._rust_cli = self.create_client(Trigger, str(self.get_parameter("rust_service").value), callback_group=self._cbg)
+        self._pcb_cli = self.create_client(Trigger, str(self.get_parameter("pcb_infer_service").value), callback_group=self._cbg)
+        self._gear_cli = self.create_client(Trigger, str(self.get_parameter("gear_infer_service").value), callback_group=self._cbg)
+
+        # Service servers
+        self.create_service(Trigger, "~/run_rust", self._on_run_rust, callback_group=self._cbg)
+        self.create_service(Trigger, "~/run_pcb", self._on_run_pcb, callback_group=self._cbg)
+        self.create_service(Trigger, "~/run_gear", self._on_run_gear, callback_group=self._cbg)
+        self.create_service(Trigger, "~/publish", self._on_publish, callback_group=self._cbg)
+
+        self.get_logger().info(
+            f"{self.get_name()} ready. Services: ~/(run_rust, run_pcb, run_gear, publish). Outputs prefix: {out_prefix}"
+        )
+
+    # -------- input callbacks --------
+
+    def _on_rust_prob(self, msg: Image) -> None:
+        with self._live_lock:
+            self._live_rust_prob = TimedMsg(msg=msg, t_mono=_now_mono())
+
+    def _on_rust_detected(self, msg: Bool) -> None:
+        with self._live_lock:
+            self._live_rust_detected = TimedMsg(msg=msg, t_mono=_now_mono())
+
+    def _on_pcb_annot(self, msg: Image) -> None:
+        with self._live_lock:
+            self._live_pcb_annot = TimedMsg(msg=msg, t_mono=_now_mono())
+
+    def _on_pcb_report(self, msg: String) -> None:
+        with self._live_lock:
+            self._live_pcb_report = TimedMsg(msg=msg, t_mono=_now_mono())
+
+    def _on_gear_annot(self, msg: Image) -> None:
+        with self._live_lock:
+            self._live_gear_annot = TimedMsg(msg=msg, t_mono=_now_mono())
+
+    def _on_gear_report(self, msg: String) -> None:
+        with self._live_lock:
+            self._live_gear_report = TimedMsg(msg=msg, t_mono=_now_mono())
+
+    # -------- helpers --------
+
+    def _call_trigger(self, client: rclpy.client.Client, timeout_s: float) -> Tuple[bool, Optional[Trigger.Response], str]:
+        if not client.service_is_ready():
+            if not client.wait_for_service(timeout_sec=timeout_s):
+                return False, None, "service_not_available"
+
+        fut = client.call_async(Trigger.Request())
+        ev = threading.Event()
+        fut.add_done_callback(lambda _f: ev.set())
+
+        if not ev.wait(timeout=timeout_s):
+            return False, None, "service_call_timeout"
+
         try:
-            data = json.loads(msg.data)
+            return True, fut.result(), ""
         except Exception as e:
-            self.get_logger().warn(f"Bad JSON in /voice/command: {e}")
+            return True, None, f"service_call_error:{e}"
+
+    def _sleep_listen_window(self, listen_s: float) -> None:
+        end_t = _now_mono() + listen_s
+        while _now_mono() < end_t:
+            time.sleep(0.02)
+
+    def _copy_live(self) -> Dict[str, Optional[TimedMsg]]:
+        with self._live_lock:
+            return {
+                "rust_prob": self._live_rust_prob,
+                "rust_det": self._live_rust_detected,
+                "pcb_annot": self._live_pcb_annot,
+                "pcb_report": self._live_pcb_report,
+                "gear_annot": self._live_gear_annot,
+                "gear_report": self._live_gear_report,
+            }
+
+    @staticmethod
+    def _is_fresh(tm: Optional[TimedMsg], window_start_mono: float) -> bool:
+        return bool(tm and tm.t_mono >= window_start_mono)
+
+    def _compose_check_report(
+        self,
+        check_name: str,
+        service_ok: bool,
+        service_err: str,
+        service_resp_success: Optional[bool],
+        service_resp_message_dict: Optional[dict],
+        topic_meta: Dict[str, Any],
+        result_fields: Dict[str, Any],
+    ) -> str:
+        out = {
+            "check": check_name,
+            "service": {
+                "called": True,
+                "call_ok": bool(service_ok),
+                "error": service_err,
+                "resp_success": service_resp_success,
+                "resp_data": service_resp_message_dict,
+            },
+            "topics": topic_meta,
+            "result": result_fields,
+            "ts_unix": time.time(),
+        }
+        return json.dumps(out, ensure_ascii=False)
+
+    @staticmethod
+    def _compute_global_ok(rust_detected: Optional[bool], pcb_ok: Optional[bool], gear_ok: Optional[bool]) -> bool:
+        return (rust_detected is False) and (pcb_ok is True) and (gear_ok is True)
+
+    def _start_ok_burst(self, value: bool) -> None:
+        duration_s = float(self.get_parameter("ok_burst_duration_s").value) or 0.0
+        rate_hz = float(self.get_parameter("ok_burst_rate_hz").value) or 0.0
+        if duration_s <= 0.0 or rate_hz <= 0.0:
+            # still publish once
+            m = Bool()
+            m.data = bool(value)
+            self._pub_ok.publish(m)
             return
 
-        intent = data.get("intent")
-        conf = float(data.get("confidence", 0.0))
+        period_s = 1.0 / max(1e-6, rate_hz)
 
-        min_conf = float(self.get_parameter("min_confidence").value)
-        if conf < min_conf:
-            self.get_logger().info(f"Ignore command intent='{intent}' conf={conf} < {min_conf}")
-            return
+        with self._ok_burst_lock:
+            # stop previous burst if any
+            if self._ok_burst_timer is not None:
+                self._ok_burst_timer.cancel()
+                self._ok_burst_timer = None
 
-        if not intent:
-            self.get_logger().warn("Command has no 'intent'")
-            return
+            self._ok_burst_value = bool(value)
+            self._ok_burst_end_mono = _now_mono() + duration_s
 
-        self.get_logger().info(f"Command received: intent='{intent}' conf={conf}")
-        self.runner.start(str(intent))
+            # publish immediately
+            m = Bool()
+            m.data = self._ok_burst_value
+            self._pub_ok.publish(m)
+
+            def _tick():
+                with self._ok_burst_lock:
+                    if _now_mono() >= self._ok_burst_end_mono:
+                        if self._ok_burst_timer is not None:
+                            self._ok_burst_timer.cancel()
+                            self._ok_burst_timer = None
+                        return
+                    v = self._ok_burst_value
+
+                mm = Bool()
+                mm.data = v
+                self._pub_ok.publish(mm)
+
+            self._ok_burst_timer = self.create_timer(period_s, _tick, callback_group=self._cbg)
+
+    def _compose_combined_report_locked(self) -> str:
+        global_ok = self._compute_global_ok(self._snap_rust_detected, self._snap_pcb_ok, self._snap_gear_ok)
+        out = {
+            "ok": global_ok,
+            "rust": {
+                "detected": self._snap_rust_detected,
+                "service_data": self._snap_rust_service,
+                "meta": self._snap_rust_meta,
+                "last_ts_unix": self._snap_rust_last_ts_unix,
+                "report": _safe_json_loads(self._snap_rust_report_str) if self._snap_rust_report_str else None,
+            },
+            "pcb": {
+                "ok": self._snap_pcb_ok,
+                "report_data": self._snap_pcb_report,
+                "meta": self._snap_pcb_meta,
+                "last_ts_unix": self._snap_pcb_last_ts_unix,
+                "report": _safe_json_loads(self._snap_pcb_report_str) if self._snap_pcb_report_str else None,
+            },
+            "gear": {
+                "ok": self._snap_gear_ok,
+                "report_data": self._snap_gear_report,
+                "meta": self._snap_gear_meta,
+                "last_ts_unix": self._snap_gear_last_ts_unix,
+                "report": _safe_json_loads(self._snap_gear_report_str) if self._snap_gear_report_str else None,
+            },
+            "ts_unix": time.time(),
+        }
+        return json.dumps(out, ensure_ascii=False)
+
+    # -------- services: run_* --------
+
+    def _on_run_rust(self, _req: Trigger.Request, res: Trigger.Response) -> Trigger.Response:
+        if not self._run_lock_rust.acquire(blocking=False):
+            res.success = False
+            res.message = json.dumps({"error": "busy_rust"}, separators=(",", ":"))
+            return res
+
+        try:
+            listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
+            timeout_s = float(self.get_parameter("rust_service_timeout_s").value) or 2.0
+
+            window_start = _now_mono()
+            call_ok, call_resp, call_err = self._call_trigger(self._rust_cli, timeout_s)
+            self._sleep_listen_window(listen_s)
+
+            live = self._copy_live()
+            got_prob = self._is_fresh(live["rust_prob"], window_start)
+            got_det_topic = self._is_fresh(live["rust_det"], window_start)
+
+            rust_prob_msg = live["rust_prob"].msg if got_prob and live["rust_prob"] else None
+            rust_det_from_topic = bool(live["rust_det"].msg.data) if got_det_topic and live["rust_det"] else None
+
+            rust_service_dict = None
+            rust_detected = None
+            resp_success = None
+
+            if call_resp is not None:
+                resp_success = bool(getattr(call_resp, "success", False))
+                msg = str(getattr(call_resp, "message", ""))
+                d = _safe_json_loads(msg)
+                if isinstance(d, dict):
+                    rust_service_dict = d
+                    rust_detected = bool(d.get("detected", resp_success))
+                else:
+                    rust_service_dict = {"raw_message": msg}
+                    rust_detected = resp_success
+            else:
+                rust_service_dict = None
+                rust_detected = None
+
+            if rust_detected is None:
+                rust_detected = rust_det_from_topic
+
+            topic_meta = {"got_rust_prob": bool(got_prob), "got_rust_detected_topic": bool(got_det_topic)}
+            meta = {
+                "listen_duration_s": listen_s,
+                "service_timeout_s": timeout_s,
+                "service_error": call_err,
+                "service_call_ok": bool(call_ok),
+                **topic_meta,
+            }
+
+            detected_source = None
+            if rust_detected is not None:
+                detected_source = "service" if call_resp is not None else "topic"
+
+            rust_report_str = self._compose_check_report(
+                "rust",
+                call_ok, call_err, resp_success,
+                rust_service_dict,
+                topic_meta,
+                {"detected": rust_detected, "detected_source": detected_source},
+            )
+
+            with self._snap_lock:
+                if rust_prob_msg is not None:
+                    self._snap_rust_prob = rust_prob_msg
+                self._snap_rust_detected = rust_detected if rust_detected is not None else None
+                self._snap_rust_service = rust_service_dict
+                self._snap_rust_report_str = rust_report_str
+                self._snap_rust_meta = meta
+                self._snap_rust_last_ts_unix = time.time()
+
+            have_any = bool(call_resp is not None or got_prob or got_det_topic)
+            res.success = bool(call_ok and have_any)
+            res.message = rust_report_str
+            return res
+
+        finally:
+            self._run_lock_rust.release()
+
+    def _on_run_pcb(self, _req: Trigger.Request, res: Trigger.Response) -> Trigger.Response:
+        if not self._run_lock_pcb.acquire(blocking=False):
+            res.success = False
+            res.message = json.dumps({"error": "busy_pcb"}, separators=(",", ":"))
+            return res
+
+        try:
+            listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
+            timeout_s = float(self.get_parameter("pcb_service_timeout_s").value) or 3.0
+
+            window_start = _now_mono()
+            call_ok, call_resp, call_err = self._call_trigger(self._pcb_cli, timeout_s)
+            self._sleep_listen_window(listen_s)
+
+            live = self._copy_live()
+            got_annot = self._is_fresh(live["pcb_annot"], window_start)
+            got_report = self._is_fresh(live["pcb_report"], window_start)
+
+            pcb_annot_msg = live["pcb_annot"].msg if got_annot and live["pcb_annot"] else None
+            pcb_report_msg = live["pcb_report"].msg if got_report and live["pcb_report"] else None
+
+            pcb_report_dict = None
+            pcb_ok = None
+            if pcb_report_msg is not None:
+                pcb_report_dict = _safe_json_loads(str(pcb_report_msg.data))
+                if isinstance(pcb_report_dict, dict):
+                    pcb_ok = _pick_bool_from_dict(pcb_report_dict, ("overall_ok", "ok", "success"), default=None)
+
+            resp_success = bool(getattr(call_resp, "success", False)) if call_resp is not None else None
+            svc_msg_dict = _safe_json_loads(str(getattr(call_resp, "message", ""))) if call_resp is not None else None
+            if call_resp is not None and not isinstance(svc_msg_dict, dict):
+                svc_msg_dict = {"raw_message": str(getattr(call_resp, "message", ""))}
+
+            topic_meta = {"got_pcb_annotated": bool(got_annot), "got_pcb_report": bool(got_report)}
+            meta = {
+                "listen_duration_s": listen_s,
+                "service_timeout_s": timeout_s,
+                "service_error": call_err,
+                "service_call_ok": bool(call_ok),
+                **topic_meta,
+            }
+
+            pcb_report_str = self._compose_check_report(
+                "pcb",
+                call_ok, call_err, resp_success,
+                svc_msg_dict,
+                topic_meta,
+                {"ok": pcb_ok},
+            )
+
+            with self._snap_lock:
+                if pcb_annot_msg is not None:
+                    self._snap_pcb_annot = pcb_annot_msg
+                self._snap_pcb_ok = pcb_ok if pcb_ok is not None else None
+                self._snap_pcb_report = pcb_report_dict if isinstance(pcb_report_dict, dict) else None
+                self._snap_pcb_report_str = pcb_report_str
+                self._snap_pcb_meta = meta
+                self._snap_pcb_last_ts_unix = time.time()
+
+            have_any = bool(call_resp is not None or got_annot or got_report)
+            res.success = bool(call_ok and have_any)
+            res.message = pcb_report_str
+            return res
+
+        finally:
+            self._run_lock_pcb.release()
+
+    def _on_run_gear(self, _req: Trigger.Request, res: Trigger.Response) -> Trigger.Response:
+        if not self._run_lock_gear.acquire(blocking=False):
+            res.success = False
+            res.message = json.dumps({"error": "busy_gear"}, separators=(",", ":"))
+            return res
+
+        try:
+            listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
+            timeout_s = float(self.get_parameter("gear_service_timeout_s").value) or 3.0
+
+            window_start = _now_mono()
+            call_ok, call_resp, call_err = self._call_trigger(self._gear_cli, timeout_s)
+            self._sleep_listen_window(listen_s)
+
+            live = self._copy_live()
+            got_annot = self._is_fresh(live["gear_annot"], window_start)
+            got_report = self._is_fresh(live["gear_report"], window_start)
+
+            gear_annot_msg = live["gear_annot"].msg if got_annot and live["gear_annot"] else None
+            gear_report_msg = live["gear_report"].msg if got_report and live["gear_report"] else None
+
+            gear_report_dict = None
+            gear_ok = None
+            if gear_report_msg is not None:
+                gear_report_dict = _safe_json_loads(str(gear_report_msg.data))
+                if isinstance(gear_report_dict, dict):
+                    gear_ok = _pick_bool_from_dict(gear_report_dict, ("overall_ok", "ok", "success"), default=None)
+
+            resp_success = bool(getattr(call_resp, "success", False)) if call_resp is not None else None
+            svc_msg_dict = _safe_json_loads(str(getattr(call_resp, "message", ""))) if call_resp is not None else None
+            if call_resp is not None and not isinstance(svc_msg_dict, dict):
+                svc_msg_dict = {"raw_message": str(getattr(call_resp, "message", ""))}
+
+            topic_meta = {"got_gear_annotated": bool(got_annot), "got_gear_report": bool(got_report)}
+            meta = {
+                "listen_duration_s": listen_s,
+                "service_timeout_s": timeout_s,
+                "service_error": call_err,
+                "service_call_ok": bool(call_ok),
+                **topic_meta,
+            }
+
+            gear_report_str = self._compose_check_report(
+                "gear",
+                call_ok, call_err, resp_success,
+                svc_msg_dict,
+                topic_meta,
+                {"ok": gear_ok},
+            )
+
+            with self._snap_lock:
+                if gear_annot_msg is not None:
+                    self._snap_gear_annot = gear_annot_msg
+                self._snap_gear_ok = gear_ok if gear_ok is not None else None
+                self._snap_gear_report = gear_report_dict if isinstance(gear_report_dict, dict) else None
+                self._snap_gear_report_str = gear_report_str
+                self._snap_gear_meta = meta
+                self._snap_gear_last_ts_unix = time.time()
+
+            have_any = bool(call_resp is not None or got_annot or got_report)
+            res.success = bool(call_ok and have_any)
+            res.message = gear_report_str
+            return res
+
+        finally:
+            self._run_lock_gear.release()
+
+    # -------- publish (one-shot) --------
+
+    def _publish_snapshot_once(self) -> Tuple[str, bool]:
+        with self._snap_lock:
+            rust_prob = self._snap_rust_prob
+            rust_det = self._snap_rust_detected
+            rust_rep = self._snap_rust_report_str
+
+            pcb_annot = self._snap_pcb_annot
+            pcb_ok = self._snap_pcb_ok
+            pcb_rep = self._snap_pcb_report_str
+
+            gear_annot = self._snap_gear_annot
+            gear_ok = self._snap_gear_ok
+            gear_rep = self._snap_gear_report_str
+
+            global_ok = self._compute_global_ok(rust_det, pcb_ok, gear_ok)
+            combined = self._compose_combined_report_locked()
+            self._snap_combined_report_str = combined
+
+        # publish snapshots
+        if rust_prob is not None:
+            self._pub_rust_prob.publish(rust_prob)
+        if rust_det is not None:
+            m = Bool()
+            m.data = bool(rust_det)
+            self._pub_rust_det.publish(m)
+        if rust_rep:
+            s = String()
+            s.data = rust_rep
+            self._pub_rust_rep.publish(s)
+
+        if pcb_annot is not None:
+            self._pub_pcb_annot.publish(pcb_annot)
+        if pcb_ok is not None:
+            m = Bool()
+            m.data = bool(pcb_ok)
+            self._pub_pcb_ok.publish(m)
+        if pcb_rep:
+            s = String()
+            s.data = pcb_rep
+            self._pub_pcb_rep.publish(s)
+
+        if gear_annot is not None:
+            self._pub_gear_annot.publish(gear_annot)
+        if gear_ok is not None:
+            m = Bool()
+            m.data = bool(gear_ok)
+            self._pub_gear_ok.publish(m)
+        if gear_rep:
+            s = String()
+            s.data = gear_rep
+            self._pub_gear_rep.publish(s)
+
+        # /ok burst for a few seconds
+        self._start_ok_burst(global_ok)
+
+        # combined report
+        s = String()
+        s.data = combined
+        self._pub_report.publish(s)
+
+        return combined, global_ok
+
+    def _on_publish(self, _req: Trigger.Request, res: Trigger.Response) -> Trigger.Response:
+        combined, _global_ok = self._publish_snapshot_once()
+
+        d = _safe_json_loads(combined) or {}
+        have_any = bool(
+            (d.get("rust", {}).get("last_ts_unix") is not None)
+            or (d.get("pcb", {}).get("last_ts_unix") is not None)
+            or (d.get("gear", {}).get("last_ts_unix") is not None)
+        )
+
+        res.success = bool(have_any)
+        res.message = combined
+        return res
 
 
-def main():
+def main() -> None:
     rclpy.init()
-    node = Inspector()
+    node = CvSessionHubNode()
+
     ex = MultiThreadedExecutor(num_threads=4)
     ex.add_node(node)
     try:

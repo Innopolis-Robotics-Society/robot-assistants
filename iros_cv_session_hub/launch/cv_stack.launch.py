@@ -132,6 +132,17 @@ def generate_launch_description():
             }],
         ),
 
+        # ---------- Gear inspector ----------
+        Node(
+            package="iros_cv_algorithms",
+            executable="gears_check",
+            name="gears_check",
+            output="screen",
+            parameters=[{
+                "image_topic": image_topic,
+            }],
+        ),
+
         # ---------- Rust detector (service-driven) ----------
         Node(
             package="iros_rust_detect_ros",
