@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 import threading
 import json
+import time
 
 import cv2
 import numpy as np
@@ -19,174 +20,41 @@ from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
 
-import torch
-import torch.nn as nn
-import segmentation_models_pytorch as smp
 import message_filters
+import onnxruntime as ort
 
 
 # -----------------------------
-# Model utils
+# ORT / math utils
 # -----------------------------
-def build_smp(arch: str, encoder: str, classes: int) -> nn.Module:
-    arch = arch.lower()
-    if arch == "linknet":
-        return smp.Linknet(encoder_name=encoder, encoder_weights="imagenet", classes=classes, activation=None)
-    if arch == "unet":
-        return smp.Unet(encoder_name=encoder, encoder_weights="imagenet", classes=classes, activation=None)
-    if arch in ("unetpp", "unet++"):
-        return smp.UnetPlusPlus(encoder_name=encoder, encoder_weights="imagenet", classes=classes, activation=None)
-    if arch == "fpn":
-        return smp.FPN(encoder_name=encoder, encoder_weights="imagenet", classes=classes, activation=None)
-    if arch in ("manet", "ma-net"):
-        return smp.MAnet(encoder_name=encoder, encoder_weights="imagenet", classes=classes, activation=None)
-    raise ValueError(f"Unknown arch: {arch}")
+IMG_PAD_MULT = 32
 
 
-def _torch_load(path: str):
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)  # type: ignore
-    except Exception:
-        try:
-            return torch.load(path, map_location="cpu", weights_only=False)  # type: ignore
-        except TypeError:
-            return torch.load(path, map_location="cpu")
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
 
 
-def infer_classes_from_state_dict(state: dict) -> Optional[int]:
-    key = "segmentation_head.0.weight"
-    if key in state and torch.is_tensor(state[key]):
-        return int(state[key].shape[0])
-    for k, v in state.items():
-        if "segmentation_head" in k and k.endswith(".weight") and torch.is_tensor(v):
-            return int(v.shape[0])
-    return None
-
-
-def infer_classes_from_module(m: nn.Module) -> Optional[int]:
-    try:
-        sh = getattr(m, "segmentation_head", None)
-        if sh is None:
-            return None
-        if hasattr(sh, "__getitem__"):
-            w = sh[0].weight
-            return int(w.shape[0])
-    except Exception:
-        pass
-    return None
-
-
-@dataclass
-class LoadedModel:
-    model: nn.Module
-    encoder: str
-    classes: int
-    arch: str
-
-
-def load_best_pt(weights_path: str, arch: str, encoder: str, classes: int, device: torch.device) -> LoadedModel:
-    obj = _torch_load(weights_path)
-
-    if isinstance(obj, nn.Module):
-        m = obj.to(device).eval()
-        if classes <= 0:
-            cls = infer_classes_from_module(m) or 1
-        else:
-            cls = classes
-        return LoadedModel(model=m, encoder=encoder, classes=int(cls), arch=arch)
-
-    if not isinstance(obj, dict):
-        raise TypeError(f"Unsupported checkpoint type: {type(obj)}")
-
-    state = obj["model"] if ("model" in obj and isinstance(obj["model"], dict)) else obj
-
-    if classes <= 0:
-        classes = int(obj.get("classes", 0) or infer_classes_from_state_dict(state) or 1)
-
-    m = build_smp(arch=arch, encoder=encoder, classes=int(classes)).to(device)
-    m.load_state_dict(state, strict=True)
-    m.eval()
-    return LoadedModel(model=m, encoder=encoder, classes=int(classes), arch=arch)
-
-
-def pad_to_multiple(img: np.ndarray, m: int = 32) -> Tuple[np.ndarray, int, int]:
+def resize_shorter_side_keep_ar(img: np.ndarray, short: int) -> np.ndarray:
     h, w = img.shape[:2]
-    nh = ((h + m - 1) // m) * m
-    nw = ((w + m - 1) // m) * m
-    pad_h = nh - h
-    pad_w = nw - w
-    if pad_h == 0 and pad_w == 0:
-        return img, h, w
-    out = cv2.copyMakeBorder(img, 0, pad_h, 0, pad_w, borderType=cv2.BORDER_CONSTANT, value=0)
-    return out, h, w
+    if h <= 0 or w <= 0:
+        return img
+    m = min(h, w)
+    if m == short:
+        return img
+    scale = float(short) / float(m)
+    nh = int(round(h * scale))
+    nw = int(round(w * scale))
+    return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
 
-@torch.no_grad()
-def predict_prob_map(
-    model: nn.Module,
-    encoder: str,
-    img_rgb_u8: np.ndarray,
-    device: torch.device,
-    classes: int,
-    rust_class_id: int,
-    tile: int,
-    stride: int,
-    amp: bool,
-) -> np.ndarray:
-    preprocessing_fn = smp.encoders.get_preprocessing_fn(encoder, "imagenet")
-
-    img = img_rgb_u8.astype(np.float32)
-    img = preprocessing_fn(img)
-
-    img_pad, oh, ow = pad_to_multiple(img, 32)
-    H, W = img_pad.shape[:2]
-
-    def forward_one(x_bchw: torch.Tensor) -> torch.Tensor:
-        if amp and device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                return model(x_bchw)
-        return model(x_bchw)
-
-    tile = int(tile)
-    stride = int(stride) if stride > 0 else tile
-
-    if tile <= 0:
-        x = torch.from_numpy(img_pad.transpose(2, 0, 1)).unsqueeze(0).float().to(device)
-        logits = forward_one(x)
-        if classes == 1:
-            prob = torch.sigmoid(logits)[:, 0]
-        else:
-            prob = torch.softmax(logits, dim=1)[:, rust_class_id]
-        return prob[0].float().cpu().numpy()[:oh, :ow]
-
-    acc = np.zeros((H, W), dtype=np.float32)
-    cnt = np.zeros((H, W), dtype=np.float32)
-
-    ys = list(range(0, max(1, H - tile + 1), stride))
-    xs = list(range(0, max(1, W - tile + 1), stride))
-    if ys[-1] != H - tile:
-        ys.append(H - tile)
-    if xs[-1] != W - tile:
-        xs.append(W - tile)
-
-    for y in ys:
-        for x0 in xs:
-            patch = img_pad[y:y + tile, x0:x0 + tile]
-            xt = torch.from_numpy(patch.transpose(2, 0, 1)).unsqueeze(0).float().to(device)
-            logits = forward_one(xt)
-
-            if classes == 1:
-                p = torch.sigmoid(logits)[:, 0]
-            else:
-                p = torch.softmax(logits, dim=1)[:, rust_class_id]
-
-            p = p[0].float().cpu().numpy()
-            acc[y:y + tile, x0:x0 + tile] += p
-            cnt[y:y + tile, x0:x0 + tile] += 1.0
-
-    cnt = np.maximum(cnt, 1.0)
-    prob = acc / cnt
-    return prob[:oh, :ow]
+def center_crop(img: np.ndarray, size: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    if h < size or w < size:
+        img = cv2.resize(img, (max(size, w), max(size, h)), interpolation=cv2.INTER_LINEAR)
+        h, w = img.shape[:2]
+    y0 = (h - size) // 2
+    x0 = (w - size) // 2
+    return img[y0:y0 + size, x0:x0 + size]
 
 
 def one_bbox_union_from_prob(
@@ -195,10 +63,6 @@ def one_bbox_union_from_prob(
     min_area: int,
     close_k: int,
 ) -> Tuple[bool, Optional[Tuple[int, int, int, int]], int, np.ndarray]:
-    """
-    Candidate extraction only. Decision is done later by confidence.
-    Returns: found_candidate, bbox, area_total, keep_mask_u8
-    """
     mask01 = (prob >= float(thr)).astype(np.uint8)
 
     if close_k > 0:
@@ -207,7 +71,6 @@ def one_bbox_union_from_prob(
         mask01 = (mask01 > 0).astype(np.uint8)
 
     empty = np.zeros(prob.shape[:2], dtype=np.uint8)
-
     if mask01.sum() == 0:
         return False, None, 0, empty
 
@@ -261,7 +124,6 @@ def region_confidence(prob: np.ndarray, keep_mask_u8: np.ndarray, mode: str, top
 
     return float(vals.mean())
 
-
 def make_prob_vis(img_rgb: np.ndarray, prob: np.ndarray, thr: float, mode: str) -> Tuple[np.ndarray, str]:
     """
     mode:
@@ -269,14 +131,17 @@ def make_prob_vis(img_rgb: np.ndarray, prob: np.ndarray, thr: float, mode: str) 
       - mask_x_gray:  mono8 = gray where prob>=thr else 0
       - prob_x_gray:  mono8 = gray * prob
       - red_overlay:  bgr8  = red mask over original
+      - glow:         bgr8  = "glowing" highlight over original (eye-catching, not red)
+      - invert_glow:  bgr8  = invert under mask + glow edge (very noticeable)
     """
     mode = (mode or "prob_u8").lower()
     prob01 = np.clip(prob, 0.0, 1.0).astype(np.float32)
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
     if mode == "prob_u8":
         out = (prob01 * 255.0).astype(np.uint8)
         return out, "mono8"
+
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
     if mode == "mask_x_gray":
         mask01 = (prob01 >= float(thr)).astype(np.uint8)
@@ -295,89 +160,192 @@ def make_prob_vis(img_rgb: np.ndarray, prob: np.ndarray, thr: float, mode: str) 
         out = cv2.addWeighted(img_bgr, 0.7, overlay, 0.3, 0.0)
         return out, "bgr8"
 
+    # ---------- new eye-catching overlays ----------
+    if mode in ("glow", "invert_glow"):
+        # base image
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
+        # hard mask at thr + soft alpha from prob
+        mask01 = (prob01 >= float(thr)).astype(np.uint8)
+
+        # make a soft "glow" halo around mask by dilate + blur
+        k = max(3, int(round(min(img_bgr.shape[:2]) * 0.01)))  # ~1% of min side
+        if k % 2 == 0:
+            k += 1
+        kernel = np.ones((max(3, k // 2), max(3, k // 2)), dtype=np.uint8)
+
+        dil = cv2.dilate(mask01, kernel, iterations=1)
+        halo = cv2.GaussianBlur(dil.astype(np.float32), (k, k), 0)  # 0..1-ish
+        halo = np.clip(halo, 0.0, 1.0)
+
+        # edge for extra contrast
+        edges = cv2.Canny((mask01 * 255).astype(np.uint8), 50, 150)
+        edges = (edges > 0).astype(np.float32)
+
+        # color palette (cyan-ish / neon)
+        # OpenCV BGR: cyan = (255,255,0) is yellowish; real cyan is (255,255,0)?? actually BGR cyan=(255,255,0) -> (B=255,G=255,R=0)
+        glow_color = np.array([255, 255, 0], dtype=np.float32)   # cyan
+        edge_color = np.array([255, 255, 255], dtype=np.float32) # white
+
+        base = img_bgr.astype(np.float32)
+
+        # optional invert under mask (very noticeable)
+        if mode == "invert_glow":
+            inv = 255.0 - base
+            a_inv = (prob01 * mask01.astype(np.float32)) * 0.55  # strength
+            base = base * (1.0 - a_inv[..., None]) + inv * a_inv[..., None]
+
+        # glow layer strength:
+        # - inside mask: use prob as alpha
+        # - around: use halo
+        a_inside = (prob01 * mask01.astype(np.float32)) * 0.65
+        a_halo = halo * 0.35
+        a = np.clip(a_inside + a_halo, 0.0, 1.0)
+
+        out = base * (1.0 - a[..., None]) + glow_color[None, None, :] * (a[..., None] * 1.0)
+
+        # add bright edge
+        a_e = edges * 0.9
+        out = out * (1.0 - a_e[..., None]) + edge_color[None, None, :] * a_e[..., None]
+
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        return out, "bgr8"
+
+    # fallback
     out = (prob01 * 255.0).astype(np.uint8)
     return out, "mono8"
 
 
 # -----------------------------
-# ROS2 Node (service-driven, Trigger)
+# ORT session container
+# -----------------------------
+@dataclass
+class OrtxModels:
+    sess_r: ort.InferenceSession
+    r_in: str
+    r_out: str
+    sess_u: ort.InferenceSession
+    u_in: str
+    u_out: str
+
+
+def make_session(path: str, use_cuda: bool) -> ort.InferenceSession:
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.intra_op_num_threads = 1
+    so.inter_op_num_threads = 1
+
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_cuda else ["CPUExecutionProvider"]
+    return ort.InferenceSession(path, sess_options=so, providers=providers)
+
+
+# -----------------------------
+# ROS2 Node (Trigger service)
 # -----------------------------
 class RustDetectNode(Node):
+    """
+    Совместимая по архитектуре нода:
+      - подписка на image_topic (и опционально sync с CameraInfo) -> кешируем последний кадр
+      - сервис Trigger: по вызову обрабатываем последний кадр
+      - pub: rust/prob (Image), rust/detected (Bool)
+    Новая логика:
+      - ResNet (ONNX) делает классификацию rust/not rust
+      - UNet (ONNX) запускается ТОЛЬКО если ResNet сказал rust
+      - rust/detected публикуется от ResNet (классификация)
+      - Trigger.message = JSON со всеми полями (ResNet + UNet метрики)
+    """
+
     def __init__(self):
         super().__init__("rust_detect_node")
 
-        # Model params
-        self.declare_parameter("weights", "")
-        self.declare_parameter("arch", "linknet")
-        self.declare_parameter("encoder", "mobilenet_v2")
-        self.declare_parameter("classes", 0)
-        self.declare_parameter("rust_class_id", 1)
+        # --- params (как раньше по стилю) ---
+        self.declare_parameter("device", "auto")          # auto|cpu|cuda
+        self.declare_parameter("amp", False)              # совместимость, не используется (ORT)
 
-        self.declare_parameter("device", "auto")  # auto|cpu|cuda
-        self.declare_parameter("amp", True)
-
-        # Candidate extraction
-        self.declare_parameter("tile", 320)
-        self.declare_parameter("stride", 256)
-        self.declare_parameter("thr", 0.35)
-        self.declare_parameter("min_area", 200)
-        self.declare_parameter("close_k", 0)
-
-        # Decision by confidence
-        self.declare_parameter("conf_thr", 0.85)      # 0..1
-        self.declare_parameter("conf_mode", "p95")    # mean|max|p95|topk
-        self.declare_parameter("topk_frac", 0.01)     # only for topk
-
-        # ROS I/O
         self.declare_parameter("image_topic", "/camera/image_raw")
         self.declare_parameter("camera_info_topic", "/camera/camera_info")
         self.declare_parameter("use_camera_info", False)
         self.declare_parameter("queue_size", 5)
         self.declare_parameter("slop", 0.05)
 
-        # Prob publish mode
         self.declare_parameter("prob_vis_mode", "prob_u8")
-
-        # Service name (Trigger)
         self.declare_parameter("service_name", "/rust_detect/run")
-
-        # Optional publish /rust/detected
         self.declare_parameter("publish_detected_topic", True)
 
-        self.bridge = CvBridge()
+        # --- ORT pipeline params ---
+        self.declare_parameter("resnet_onnx", "")         # путь к resnet*.onnx
+        self.declare_parameter("unet_onnx", "")           # путь к unet*.onnx
+        self.declare_parameter("resnet_thr", 0.5)         # порог классификации
+        self.declare_parameter("mask_thr", 0.5)           # порог для визуализации/бинаризации маски
+        self.declare_parameter("warmup", 20)              # прогрев сессий
+        self.declare_parameter("log_timing", True)
 
-        # cache last image
+        # Candidate extraction + confidence (как раньше)
+        self.declare_parameter("thr", 0.35)               # порог candidate extraction по prob-map
+        self.declare_parameter("min_area", 200)
+        self.declare_parameter("close_k", 0)
+
+        self.declare_parameter("conf_thr", 0.85)
+        self.declare_parameter("conf_mode", "p95")
+        self.declare_parameter("topk_frac", 0.01)
+
+        self.bridge = CvBridge()
         self._img_lock = threading.Lock()
         self._proc_lock = threading.Lock()
         self._last_img_msg: Optional[Image] = None
 
-        # Load model
-        weights = self.get_parameter("weights").get_parameter_value().string_value
-        if not weights:
-            raise RuntimeError("Parameter 'weights' is empty. Pass -p weights:=/abs/path/to/model.pt or .pth")
-
-        arch = self.get_parameter("arch").get_parameter_value().string_value
-        encoder = self.get_parameter("encoder").get_parameter_value().string_value
-        classes = int(self.get_parameter("classes").value)
-
+        # --- choose CUDA provider ---
         device_str = self.get_parameter("device").get_parameter_value().string_value.strip().lower()
         if device_str == "auto":
-            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+            device_str = "cuda" if ("CUDAExecutionProvider" in ort.get_available_providers()) else "cpu"
         if device_str not in ("cpu", "cuda"):
             device_str = "cpu"
-        self.device = torch.device(device_str)
+        self.use_cuda = (device_str == "cuda")
 
-        self.amp = bool(self.get_parameter("amp").value) and (self.device.type == "cuda")
+        # --- resolve model paths ---
+        resnet_path = self.get_parameter("resnet_onnx").get_parameter_value().string_value.strip()
+        unet_path = self.get_parameter("unet_onnx").get_parameter_value().string_value.strip()
 
-        lm = load_best_pt(weights_path=weights, arch=arch, encoder=encoder, classes=classes, device=self.device)
-        self.model = lm.model
-        self.encoder = lm.encoder
-        self.classes = lm.classes
-        self.arch = lm.arch
+        if not resnet_path or not unet_path:
+            # try take from share/<pkg>/onnx_models
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                share = Path(get_package_share_directory("iros_rust_detect_ros"))
+                # prefer fp16
+                cand_r = share / "onnx_models" / "resnet_fp16.onnx"
+                cand_u = share / "onnx_models" / "unet_fp16.onnx"
+                if not cand_r.exists():
+                    cand_r = share / "onnx_models" / "resnet.onnx"
+                if not cand_u.exists():
+                    cand_u = share / "onnx_models" / "unet.onnx"
+                if not resnet_path and cand_r.exists():
+                    resnet_path = str(cand_r)
+                if not unet_path and cand_u.exists():
+                    unet_path = str(cand_u)
+            except Exception:
+                pass
 
-        self.get_logger().info(
-            f"Loaded: {weights} arch={self.arch} enc={self.encoder} classes={self.classes} device={self.device} amp={self.amp}"
-        )
+        if not resnet_path or not unet_path:
+            raise RuntimeError(
+                "ONNX paths are empty. Set params resnet_onnx and unet_onnx, "
+                "or install onnx_models into share/iros_rust_detect_ros/onnx_models."
+            )
+
+        if not Path(resnet_path).exists():
+            raise RuntimeError(f"ResNet ONNX not found: {resnet_path}")
+        if not Path(unet_path).exists():
+            raise RuntimeError(f"UNet ONNX not found: {unet_path}")
+
+        # --- create sessions ---
+        self.models = self._load_ort_models(resnet_path, unet_path, self.use_cuda)
+
+        self.get_logger().info(f"ORT providers available: {ort.get_available_providers()} | use_cuda={self.use_cuda}")
+        self.get_logger().info(f"Loaded ONNX: resnet={resnet_path} unet={unet_path}")
+
+        # --- warmup ---
+        warmup = int(self.get_parameter("warmup").value)
+        if warmup > 0:
+            self._warmup(warmup)
 
         # Publishers
         self.pub_prob = self.create_publisher(Image, "rust/prob", 10)
@@ -408,6 +376,33 @@ class RustDetectNode(Node):
 
         self.get_logger().info(f"Subscribing (cache sync): image={image_topic} camera_info={cam_info_topic}")
 
+    def _load_ort_models(self, resnet_path: str, unet_path: str, use_cuda: bool) -> OrtxModels:
+        sess_r = make_session(resnet_path, use_cuda)
+        sess_u = make_session(unet_path, use_cuda)
+
+        r_in = sess_r.get_inputs()[0].name
+        r_out = sess_r.get_outputs()[0].name
+        u_in = sess_u.get_inputs()[0].name
+        u_out = sess_u.get_outputs()[0].name
+
+        self.get_logger().info(f"ResNet providers: {sess_r.get_providers()}")
+        self.get_logger().info(f"UNet providers:   {sess_u.get_providers()}")
+
+        return OrtxModels(sess_r, r_in, r_out, sess_u, u_in, u_out)
+
+    def _warmup(self, n: int):
+        # ResNet input: (1,3,224,224)
+        x_r = np.zeros((1, 3, 224, 224), dtype=np.float32)
+        # UNet input: (1,3,480,480)
+        x_u = np.zeros((1, 3, 480, 480), dtype=np.float32)
+
+        t0 = time.perf_counter()
+        for _ in range(n):
+            _ = self.models.sess_r.run([self.models.r_out], {self.models.r_in: x_r})[0]
+            _ = self.models.sess_u.run([self.models.u_out], {self.models.u_in: x_u})[0]
+        dt = (time.perf_counter() - t0) * 1000.0
+        self.get_logger().info(f"Warmup {n} iters done: {dt:.1f} ms")
+
     def on_image_only(self, msg_img: Image):
         with self._img_lock:
             self._last_img_msg = msg_img
@@ -428,46 +423,118 @@ class RustDetectNode(Node):
         with self._proc_lock:
             info = self._process_once_and_publish_prob(msg_img)
 
+        # success = ResNet классификация (detected)
         res.success = bool(info.get("detected", False))
         res.message = json.dumps(info, separators=(",", ":"))
         return res
 
+    # ---------- Inference blocks ----------
+    def _resnet_prob(self, rgb_u8: np.ndarray) -> float:
+        """
+        Как torchvision transforms:
+          Resize(256) по короткой стороне (с сохранением AR),
+          CenterCrop(224),
+          Normalize(ImageNet),
+          -> float32 NCHW (1,3,224,224)
+        """
+        img = resize_shorter_side_keep_ar(rgb_u8, 256)
+        img = center_crop(img, 224)
+
+        x = img.astype(np.float32) / 255.0  # HWC 0..1
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        x = (x - mean) / std
+        x = np.transpose(x, (2, 0, 1))[None, ...].astype(np.float32)  # 1x3x224x224
+
+        logit = self.models.sess_r.run([self.models.r_out], {self.models.r_in: x})[0]
+        logit = float(np.asarray(logit).reshape(-1)[0])
+        return float(1.0 / (1.0 + np.exp(-logit)))
+
+    def _unet_probmap_480(self, rgb_u8: np.ndarray) -> np.ndarray:
+        """
+        ВАЖНО: ровно 480x480, чтобы соответствовать ONNX (если экспорт был фиксированный).
+        Вход float32 NCHW (1,3,480,480).
+        Выход: prob map float32 (480,480) в диапазоне 0..1.
+        """
+        img = cv2.resize(rgb_u8, (480, 480), interpolation=cv2.INTER_LINEAR)
+        x = img.astype(np.float32) / 255.0
+        x = np.transpose(x, (2, 0, 1))[None, ...].astype(np.float32)
+
+        out = self.models.sess_u.run([self.models.u_out], {self.models.u_in: x})[0]
+        out = np.asarray(out)
+
+        if out.ndim == 4:
+            out = out[0, 0]
+        elif out.ndim == 3:
+            out = out[0]
+        else:
+            raise RuntimeError(f"Unexpected UNet output shape: {out.shape}")
+
+        out = out.astype(np.float32)
+
+        # если logits
+        if out.min() < 0.0 or out.max() > 1.0:
+            out = sigmoid_np(out)
+
+        return np.clip(out, 0.0, 1.0)
+
+    # ---------- Main processing ----------
     def _process_once_and_publish_prob(self, msg_img: Image) -> dict:
-        tile = int(self.get_parameter("tile").value)
-        stride = int(self.get_parameter("stride").value)
+        prob_vis_mode = self.get_parameter("prob_vis_mode").get_parameter_value().string_value
+        publish_detected_topic = bool(self.get_parameter("publish_detected_topic").value)
+
+        resnet_thr = float(self.get_parameter("resnet_thr").value)
+        mask_thr = float(self.get_parameter("mask_thr").value)
+
         thr = float(self.get_parameter("thr").value)
         min_area = int(self.get_parameter("min_area").value)
         close_k = int(self.get_parameter("close_k").value)
-        rust_class_id = int(self.get_parameter("rust_class_id").value)
-        prob_vis_mode = self.get_parameter("prob_vis_mode").get_parameter_value().string_value
 
         conf_thr = float(self.get_parameter("conf_thr").value)
         conf_mode = self.get_parameter("conf_mode").get_parameter_value().string_value
         topk_frac = float(self.get_parameter("topk_frac").value)
 
-        publish_detected_topic = bool(self.get_parameter("publish_detected_topic").value)
+        log_timing = bool(self.get_parameter("log_timing").value)
+
+        t0 = time.perf_counter()
 
         bgr = self.bridge.imgmsg_to_cv2(msg_img, desired_encoding="bgr8")
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        oh, ow = rgb.shape[:2]
 
-        prob = predict_prob_map(
-            model=self.model,
-            encoder=self.encoder,
-            img_rgb_u8=rgb,
-            device=self.device,
-            classes=self.classes,
-            rust_class_id=rust_class_id,
-            tile=tile,
-            stride=stride,
-            amp=self.amp,
-        )
+        t1 = time.perf_counter()
+        rust_prob = self._resnet_prob(rgb)
+        rust_pred = bool(rust_prob >= resnet_thr)
 
-        found, bbox, area, keep_mask_u8 = one_bbox_union_from_prob(prob, thr=thr, min_area=min_area, close_k=close_k)
-        conf = region_confidence(prob, keep_mask_u8, conf_mode, topk_frac) if found else 0.0
-        detected = bool(found and (conf >= conf_thr))
+        # detected публикуется от ResNet (классификация)
+        detected_cls = rust_pred
 
-        # publish prob image (on every service call)
-        prob_vis, enc = make_prob_vis(rgb, prob, thr=thr, mode=prob_vis_mode)
+        t2 = time.perf_counter()
+
+        run_unet = rust_pred
+        unet_found = False
+        unet_bbox = None
+        unet_area = 0
+        unet_conf = 0.0
+        unet_detected = False
+
+        # prob_full публикуем на rust/prob
+        prob_full = np.zeros((oh, ow), dtype=np.float32)
+
+        if run_unet:
+            prob_480 = self._unet_probmap_480(rgb)
+            prob_full = cv2.resize(prob_480, (ow, oh), interpolation=cv2.INTER_LINEAR)
+
+            unet_found, unet_bbox, unet_area, keep_mask_u8 = one_bbox_union_from_prob(
+                prob_full, thr=thr, min_area=min_area, close_k=close_k
+            )
+            unet_conf = region_confidence(prob_full, keep_mask_u8, conf_mode, topk_frac) if unet_found else 0.0
+            unet_detected = bool(unet_found and (unet_conf >= conf_thr))
+
+        t3 = time.perf_counter()
+
+        # publish prob image
+        prob_vis, enc = make_prob_vis(rgb, prob_full, thr=mask_thr, mode=prob_vis_mode)
         if enc == "mono8":
             msg_prob = self.bridge.cv2_to_imgmsg(prob_vis, encoding="mono8")
         else:
@@ -475,37 +542,50 @@ class RustDetectNode(Node):
         msg_prob.header = msg_img.header
         self.pub_prob.publish(msg_prob)
 
-        # optional Bool topic
+        # publish Bool (ResNet)
         if publish_detected_topic:
             m = Bool()
-            m.data = bool(detected)
+            m.data = bool(detected_cls)
             self.pub_detected.publish(m)
 
-        if bbox is None:
-            bbox_list = None
-        else:
-            x0, y0, x1, y1 = bbox
-            bbox_list = [int(x0), int(y0), int(x1), int(y1)]
+        if log_timing:
+            dt_total = (t3 - t0) * 1000.0
+            dt_r = (t2 - t1) * 1000.0
+            dt_u = (t3 - t2) * 1000.0
+            self.get_logger().info(
+                f"timing: total={dt_total:.2f}ms resnet={dt_r:.2f}ms unet+post={dt_u:.2f}ms "
+                f"| rust_prob={rust_prob:.3f} resnet_pred={int(rust_pred)} unet_ran={int(run_unet)} unet_detected={int(unet_detected)}"
+            )
+
+        bbox_list = None if unet_bbox is None else [int(unet_bbox[0]), int(unet_bbox[1]), int(unet_bbox[2]), int(unet_bbox[3])]
 
         return {
-            "detected": bool(detected),
-            "found_candidate": bool(found),
-            "conf": float(conf),
-            "conf_thr": float(conf_thr),
-            "conf_mode": str(conf_mode),
-            "topk_frac": float(topk_frac),
+            # ResNet classification = main decision (and rust/detected)
+            "detected": bool(detected_cls),
+            "rust_prob": float(rust_prob),
+            "resnet_thr": float(resnet_thr),
+            "run_unet": bool(run_unet),
+
+            # UNet info (report only)
+            "unet_found_candidate": bool(unet_found),
+            "unet_conf": float(unet_conf),
+            "unet_conf_thr": float(conf_thr),
+            "unet_conf_mode": str(conf_mode),
+            "unet_topk_frac": float(topk_frac),
+            "unet_detected": bool(unet_detected),
+
+            # thresholds / morphology
             "thr": float(thr),
+            "mask_thr": float(mask_thr),
             "min_area": int(min_area),
             "close_k": int(close_k),
-            "area": int(area),
+
+            "area": int(unet_area),
             "bbox_xyxy": bbox_list,
-            "tile": int(tile),
-            "stride": int(stride),
-            "rust_class_id": int(rust_class_id),
-            "classes": int(self.classes),
-            "arch": str(self.arch),
-            "encoder": str(self.encoder),
+
             "prob_topic": "rust/prob",
+            "detected_topic": "rust/detected",
+            "device": "cuda" if self.use_cuda else "cpu",
         }
 
 

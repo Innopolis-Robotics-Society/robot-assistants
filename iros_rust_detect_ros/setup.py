@@ -12,17 +12,19 @@ setup(
         ("share/ament_index/resource_index/packages", [os.path.join("resource", package_name)]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", glob("launch/*.py")),
+        ("share/" + package_name + "/onnx_models", glob("onnx_models/*.onnx")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="mobile",
     maintainer_email="mobile@todo.todo",
-    description="Rust detection node (segmentation -> bbox + overlay)",
+    description="Rust detection node",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "rust_detect_node = iros_rust_detect_ros.rust_detect_node:main",
+            "debug_image_publisher = iros_rust_detect_ros.debug_image_publisher:main",
         ],
     },
 )
