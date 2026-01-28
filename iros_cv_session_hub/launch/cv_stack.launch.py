@@ -4,11 +4,12 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+from launch.substitutions import PathJoinSubstitution
 
 
 def generate_launch_description():
     # ---------- launch args ----------
-    weights = LaunchConfiguration("weights")
     image_topic = LaunchConfiguration("image_topic")
 
     rust_service = LaunchConfiguration("rust_service")
@@ -22,59 +23,52 @@ def generate_launch_description():
     pcb_service_timeout_s = LaunchConfiguration("pcb_service_timeout_s")
     gear_service_timeout_s = LaunchConfiguration("gear_service_timeout_s")
 
+    # hub input topics
+    rust_prob_topic = LaunchConfiguration("rust_prob_topic")
+    rust_detected_topic = LaunchConfiguration("rust_detected_topic")
+    pcb_report_topic = LaunchConfiguration("pcb_report_topic")
+    pcb_annotated_topic = LaunchConfiguration("pcb_annotated_topic")
+    gear_report_topic = LaunchConfiguration("gear_report_topic")
+    gear_annotated_topic = LaunchConfiguration("gear_annotated_topic")
+
     # optional debug image publisher
     use_debug_pub = LaunchConfiguration("use_debug_publisher")
     image_dir = LaunchConfiguration("image_dir")
     debug_rate_hz = LaunchConfiguration("debug_rate_hz")
     debug_loop = LaunchConfiguration("debug_loop")
 
-    # rust params (optional override)
-    rust_thr = LaunchConfiguration("rust_thr")
-    rust_min_area = LaunchConfiguration("rust_min_area")
-    rust_tile = LaunchConfiguration("rust_tile")
-    rust_stride = LaunchConfiguration("rust_stride")
+    # rust ORT params
     rust_device = LaunchConfiguration("rust_device")
-    rust_amp = LaunchConfiguration("rust_amp")
+    rust_use_camera_info = LaunchConfiguration("rust_use_camera_info")
+    rust_resnet_onnx = LaunchConfiguration("rust_resnet_onnx")
+    rust_unet_onnx = LaunchConfiguration("rust_unet_onnx")
+    rust_warmup = LaunchConfiguration("rust_warmup")
+    rust_resnet_thr = LaunchConfiguration("rust_resnet_thr")
+    rust_thr = LaunchConfiguration("rust_thr")
+    rust_conf_thr = LaunchConfiguration("rust_conf_thr")
+    rust_mask_thr = LaunchConfiguration("rust_mask_thr")
     rust_prob_vis_mode = LaunchConfiguration("rust_prob_vis_mode")
+    rust_log_timing = LaunchConfiguration("rust_log_timing")
 
-    # hub input topics (configurable)
-    rust_prob_topic = LaunchConfiguration("rust_prob_topic")
-    rust_detected_topic = LaunchConfiguration("rust_detected_topic")
-
-    pcb_report_topic = LaunchConfiguration("pcb_report_topic")
-    pcb_annotated_topic = LaunchConfiguration("pcb_annotated_topic")
-
-    gear_report_topic = LaunchConfiguration("gear_report_topic")
-    gear_annotated_topic = LaunchConfiguration("gear_annotated_topic")
+    # defaults for ONNX from installed share
+    default_resnet = PathJoinSubstitution([
+        FindPackageShare("iros_rust_detect_ros"), "onnx_models", "resnet_fp16.onnx"
+    ])
+    default_unet = PathJoinSubstitution([
+        FindPackageShare("iros_rust_detect_ros"), "onnx_models", "unet_fp16.onnx"
+    ])
 
     return LaunchDescription([
         # ---------- arguments ----------
-        DeclareLaunchArgument(
-            "weights",
-            default_value="/home/mobile/ros2_ws/src/iros_rust_detect_ros/models/speedup_l1_s0.35.pth",
-            description="Path to rust segmentation checkpoint (.pth/.pt)."
-        ),
         DeclareLaunchArgument(
             "image_topic",
             default_value="/image_raw",
             description="Camera topic."
         ),
 
-        DeclareLaunchArgument(
-            "rust_service",
-            default_value="/rust_detect/run",
-            description="Rust Trigger service name."
-        ),
-        DeclareLaunchArgument(
-            "pcb_infer_service",
-            default_value="/pcb_inspector/inference",
-            description="PCB Trigger inference service name."
-        ),
-        DeclareLaunchArgument(
-            "gear_infer_service",
-            default_value="/gears_check/inference",
-            description="Gear Trigger inference service name."
-        ),
+        DeclareLaunchArgument("rust_service", default_value="/rust_detect/run"),
+        DeclareLaunchArgument("pcb_infer_service", default_value="/pcb_inspector/inference"),
+        DeclareLaunchArgument("gear_infer_service", default_value="/gears_check/inference"),
 
         DeclareLaunchArgument("listen_duration_s", default_value="2.0"),
         DeclareLaunchArgument("output_prefix", default_value="/cv_hub"),
@@ -91,20 +85,24 @@ def generate_launch_description():
         DeclareLaunchArgument("gear_report_topic", default_value="/gears_check/report"),
         DeclareLaunchArgument("gear_annotated_topic", default_value="/gears_check/annotated"),
 
-        # debug publisher
+        # debug publisher (по умолчанию выключен)
         DeclareLaunchArgument("use_debug_publisher", default_value="false"),
         DeclareLaunchArgument("image_dir", default_value=""),
-        DeclareLaunchArgument("debug_rate_hz", default_value="2.0"),
+        DeclareLaunchArgument("debug_rate_hz", default_value="1.0"),
         DeclareLaunchArgument("debug_loop", default_value="true"),
 
-        # rust overrides
+        # rust ORT overrides (твои желаемые дефолты)
+        DeclareLaunchArgument("rust_device", default_value="cpu"),
+        DeclareLaunchArgument("rust_use_camera_info", default_value="false"),
+        DeclareLaunchArgument("rust_resnet_onnx", default_value=default_resnet),
+        DeclareLaunchArgument("rust_unet_onnx", default_value=default_unet),
+        DeclareLaunchArgument("rust_warmup", default_value="0"),
+        DeclareLaunchArgument("rust_resnet_thr", default_value="0.5"),
         DeclareLaunchArgument("rust_thr", default_value="0.35"),
-        DeclareLaunchArgument("rust_min_area", default_value="200"),
-        DeclareLaunchArgument("rust_tile", default_value="320"),
-        DeclareLaunchArgument("rust_stride", default_value="256"),
-        DeclareLaunchArgument("rust_device", default_value="auto"),
-        DeclareLaunchArgument("rust_amp", default_value="true"),
-        DeclareLaunchArgument("rust_prob_vis_mode", default_value="prob_x_gray"),
+        DeclareLaunchArgument("rust_conf_thr", default_value="0.85"),
+        DeclareLaunchArgument("rust_mask_thr", default_value="0.5"),
+        DeclareLaunchArgument("rust_prob_vis_mode", default_value="invert_glow"),
+        DeclareLaunchArgument("rust_log_timing", default_value="true"),
 
         # ---------- optional debug image publisher ----------
         Node(
@@ -143,28 +141,32 @@ def generate_launch_description():
             }],
         ),
 
-        # ---------- Rust detector (service-driven) ----------
+        # ---------- Rust detector (ORT, service-driven) ----------
         Node(
             package="iros_rust_detect_ros",
             executable="rust_detect_node",
             name="rust_detect_node",
             output="screen",
             parameters=[{
-                "weights": weights,
+                "device": rust_device,
                 "image_topic": image_topic,
+                "use_camera_info": rust_use_camera_info,
                 "service_name": rust_service,
 
+                "resnet_onnx": rust_resnet_onnx,
+                "unet_onnx": rust_unet_onnx,
+                "warmup": rust_warmup,
+                "resnet_thr": rust_resnet_thr,
+
                 "thr": rust_thr,
-                "min_area": rust_min_area,
-                "tile": rust_tile,
-                "stride": rust_stride,
-                "device": rust_device,
-                "amp": rust_amp,
+                "conf_thr": rust_conf_thr,
+                "mask_thr": rust_mask_thr,
                 "prob_vis_mode": rust_prob_vis_mode,
+                "log_timing": rust_log_timing,
             }],
         ),
 
-        # ---------- Session hub (3 run triggers + 1 publish trigger, no timer) ----------
+        # ---------- Session hub ----------
         Node(
             package="iros_cv_session_hub",
             executable="iros_cv_session_hub",

@@ -17,7 +17,7 @@ def generate_launch_description():
     nad = static_tf('nad', 0.341, 0.504, 0.422, 0.0, 0.0, 1.5706, 'world', 'pose_up')
 
     poi_pcb = static_tf('poi_pcb', 0.3422, 0.570, 0.362, 0.0, 0.0, 1.5706, 'world', 'poi_pcb')
-    poi_gear_common = static_tf('poi_gear_common', 0.3049, 0.486, 0.3647, 0.0, 0.0, 1.5706, 'world', 'poi_gear_common')
+    poi_gear_common = static_tf('poi_gear_common', 0.3422, 0.500, 0.3647, 0.0, 0.0, 1.5706, 'world', 'poi_gear_common')
     # poi_pcb = static_tf('poi_pcb', 0.346, 0.583, 0.357, 0.0, 0.0, -1.5706, 'world', 'poi_pcb')
     # poi_pcb = static_tf('poi_pcb', 0.346, 0.583, 0.357, 0.0, 0.0, -1.5706, 'world', 'poi_pcb')
 

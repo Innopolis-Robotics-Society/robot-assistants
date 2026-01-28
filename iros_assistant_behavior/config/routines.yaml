@@ -147,11 +147,11 @@ routines:
         service_type: iros_custom_msgs/srv/GoToFrame
         request: { frame: poi_gear_common }
 
-      - type: service
-        service_name: /gears_check/calibration
-        service_type: std_srvs/srv/Trigger
-        request: {}
-        service_timeout_sec: 20.0
+      # - type: service
+      #   service_name: /gears_check/calibration
+      #   service_type: std_srvs/srv/Trigger
+      #   request: {}
+      #   service_timeout_sec: 20.0
 
   reset:
     steps:
@@ -161,8 +161,8 @@ routines:
         request: {}
         service_timeout_sec: 20.0
 
-      - type: service
-        service_name: /gears_check/reset
-        service_type: std_srvs/srv/Trigger
-        request: {}
-        service_timeout_sec: 20.0
+      # - type: service
+      #   service_name: /gears_check/reset
+      #   service_type: std_srvs/srv/Trigger
+      #   request: {}
+      #   service_timeout_sec: 20.0

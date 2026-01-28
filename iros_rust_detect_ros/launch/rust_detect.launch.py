@@ -23,4 +23,6 @@ def generate_launch_description():
                 "camera_info_topic": "/camera_info",
             }],
         )
+
+
     ])

@@ -1,381 +1,146 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+from __future__ import annotations
 
 import json
-import time
 import threading
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
-import numpy as np
-import cv2
+import time
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
-from sensor_msgs.msg import Image
-from std_msgs.msg import String
 from std_srvs.srv import Trigger
-
-try:
-    from cv_bridge import CvBridge
-except Exception as e:
-    CvBridge = None
+from std_msgs.msg import String
+from sensor_msgs.msg import Image
 
 
-@dataclass
-class DetectResult:
-    ok: bool
-    reason: str
-    circles: Optional[np.ndarray] = None   # shape (N, 3) float32/float64: x, y, r
-    vector: Optional[np.ndarray] = None    # shape (expected_gears,) float64 radii (sorted)
-    debug_img: Optional[np.ndarray] = None
+def _now_mono() -> float:
+    return time.monotonic()
 
 
-def sort_circles_top_left_to_bottom_right(circles: np.ndarray, y_tol: int = 25) -> np.ndarray:
+class GearInspectorStub(Node):
     """
-    circles: (N, 3) -> sort by rows (y with tolerance), then by x
+    Stub "gear inspector":
+    - Subscribes to image_topic and caches the latest Image
+    - Service /gear_inspector/inference (Trigger):
+        * waits for (fresh) image
+        * republishes it to /gear_inspector/annotated (no processing)
+        * publishes JSON report to /gear_inspector/report with overall_ok=True
+        * returns Trigger success=True
     """
-    if circles is None or len(circles) == 0:
-        return circles
 
-    circles = np.asarray(circles, dtype=float)
+    def __init__(self) -> None:
+        super().__init__("gear_inspector_stub")
 
-    # First sort by y
-    idx = np.argsort(circles[:, 1])
-    circles = circles[idx]
+        self._cbg = ReentrantCallbackGroup()
 
-    # Group by y bands
-    groups: List[np.ndarray] = []
-    current = [circles[0]]
-    for c in circles[1:]:
-        if abs(c[1] - current[-1][1]) <= y_tol:
-            current.append(c)
-        else:
-            groups.append(np.array(current))
-            current = [c]
-    groups.append(np.array(current))
-
-    # Sort each group by x, then flatten
-    sorted_list = []
-    for g in groups:
-        g_idx = np.argsort(g[:, 0])
-        sorted_list.append(g[g_idx])
-
-    return np.vstack(sorted_list)
-
-
-class GearsCheckNode(Node):
-    def __init__(self):
-        super().__init__("gears_check")
-
-        # -------------------------
-        # Parameters
-        # -------------------------
+        # ---- params ----
         self.declare_parameter("image_topic", "/image_raw")
-        self.declare_parameter("expected_gears", 4)
-        self.declare_parameter("calib_frames", 5)
-        self.declare_parameter("check_frames", 3)
 
-        # Detection parameters
-        self.declare_parameter("blur_ksize", 7)          # odd
-        self.declare_parameter("hough_dp", 1.2)
-        self.declare_parameter("hough_min_dist", 40.0)
-        self.declare_parameter("hough_param1", 120.0)    # Canny high
-        self.declare_parameter("hough_param2", 35.0)     # accumulator threshold
-        self.declare_parameter("min_radius", 10)
-        self.declare_parameter("max_radius", 0)          # 0 = no limit
-        self.declare_parameter("sort_y_tol", 25)
+        self.declare_parameter("service_name", "/gears_check/inference")
 
-        # Validation + comparison tolerances
-        self.declare_parameter("radius_round", True)
-        self.declare_parameter("max_radius_std", 9999.0)  # optional sanity check
-        self.declare_parameter("diff_threshold", 2.0)      # for check vs calibration (per element)
+        self.declare_parameter("annotated_topic", "/gears_check/annotated")
+        self.declare_parameter("report_topic", "/gears_check/report")
 
-        # IO topics
-        self.declare_parameter("out_image_topic", "~/image")
-        self.declare_parameter("out_data_topic", "~/data")
+        # wait behavior for image on service call
+        self.declare_parameter("wait_image_timeout_s", 2.0)
+        self.declare_parameter("require_fresh_image", True)  # if True, waits for image AFTER service call start
 
-        self.image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
-        self.expected_gears = int(self.get_parameter("expected_gears").value)
+        image_topic = str(self.get_parameter("image_topic").value)
+        service_name = str(self.get_parameter("service_name").value)
+        annotated_topic = str(self.get_parameter("annotated_topic").value)
+        report_topic = str(self.get_parameter("report_topic").value)
 
-        out_image_topic = self.get_parameter("out_image_topic").get_parameter_value().string_value
-        out_data_topic = self.get_parameter("out_data_topic").get_parameter_value().string_value
-
-        # -------------------------
-        # ROS interfaces
-        # -------------------------
-        self.bridge = CvBridge() if CvBridge is not None else None
-        if self.bridge is None:
-            raise RuntimeError("cv_bridge is required but not available in this environment.")
-
-        self.sub = self.create_subscription(Image, self.image_topic, self._on_image, 10)
-        self.pub_img = self.create_publisher(Image, out_image_topic, 10)
-        self.pub_data = self.create_publisher(String, out_data_topic, 10)
-
-        self.srv_calib = self.create_service(Trigger, "~/calibration", self._on_calibration)
-        self.srv_check = self.create_service(Trigger, "~/check", self._on_check)
-
-        # -------------------------
-        # Frame synchronization
-        # -------------------------
+        # ---- state ----
         self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
-        self._last_frame_id = 0
-        self._last_cv_img: Optional[np.ndarray] = None
+        self._last_img: Optional[Image] = None
+        self._last_img_t_mono: float = 0.0
+        self._img_event = threading.Event()
 
-        # Calibration state
-        self._calib_vector: Optional[np.ndarray] = None
+        # ---- I/O ----
+        self._sub = self.create_subscription(
+            Image, image_topic, self._on_image, qos_profile_sensor_data, callback_group=self._cbg
+        )
+        self._pub_annot = self.create_publisher(Image, annotated_topic, qos_profile_sensor_data)
+        self._pub_report = self.create_publisher(String, report_topic, 10)
+
+        self._srv = self.create_service(Trigger, service_name, self._on_inference, callback_group=self._cbg)
 
         self.get_logger().info(
-            f"gears_check started: image_topic={self.image_topic}, out_image={out_image_topic}, out_data={out_data_topic}"
+            f"gear_inspector_stub ready: service={service_name} image_topic={image_topic} "
+            f"annotated_topic={annotated_topic} report_topic={report_topic}"
         )
 
-    # -------------------------
-    # Image callback
-    # -------------------------
-    def _on_image(self, msg: Image):
-        try:
-            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            self.get_logger().error(f"imgmsg_to_cv2 failed: {e}")
-            return
+    def _on_image(self, msg: Image) -> None:
+        with self._lock:
+            self._last_img = msg
+            self._last_img_t_mono = _now_mono()
+            self._img_event.set()
 
-        with self._cond:
-            self._last_cv_img = cv_img
-            self._last_frame_id += 1
-            self._cond.notify_all()
+    def _get_image(self, start_mono: float, timeout_s: float, require_fresh: bool) -> Optional[Image]:
+        deadline = _now_mono() + max(0.0, timeout_s)
 
-    def _wait_new_frame(self, prev_id: int, timeout_s: float = 2.0) -> Tuple[bool, int, Optional[np.ndarray]]:
-        deadline = time.time() + timeout_s
-        with self._cond:
-            while self._last_frame_id <= prev_id:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    return False, self._last_frame_id, None
-                self._cond.wait(timeout=remaining)
-            return True, self._last_frame_id, self._last_cv_img.copy() if self._last_cv_img is not None else None
+        while _now_mono() < deadline:
+            with self._lock:
+                img = self._last_img
+                t_mono = self._last_img_t_mono
 
-    # -------------------------
-    # Detection
-    # -------------------------
-    def _detect_gears(self, bgr: np.ndarray) -> DetectResult:
-        expected = int(self.get_parameter("expected_gears").value)
+            if img is not None and (not require_fresh or t_mono >= start_mono):
+                return img
 
-        blur_ksize = int(self.get_parameter("blur_ksize").value)
-        blur_ksize = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
+            # wait a bit for new image
+            remaining = deadline - _now_mono()
+            self._img_event.wait(timeout=min(0.05, max(0.0, remaining)))
+            self._img_event.clear()
 
-        dp = float(self.get_parameter("hough_dp").value)
-        min_dist = float(self.get_parameter("hough_min_dist").value)
-        p1 = float(self.get_parameter("hough_param1").value)
-        p2 = float(self.get_parameter("hough_param2").value)
-        min_r = int(self.get_parameter("min_radius").value)
-        max_r = int(self.get_parameter("max_radius").value)
-        y_tol = int(self.get_parameter("sort_y_tol").value)
+        return None
 
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        if blur_ksize > 1:
-            gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+    def _on_inference(self, _req: Trigger.Request, res: Trigger.Response) -> Trigger.Response:
+        start_mono = _now_mono()
+        timeout_s = float(self.get_parameter("wait_image_timeout_s").value)
+        require_fresh = bool(self.get_parameter("require_fresh_image").value)
 
-        circles = cv2.HoughCircles(
-            gray,
-            cv2.HOUGH_GRADIENT,
-            dp=dp,
-            minDist=min_dist,
-            param1=p1,
-            param2=p2,
-            minRadius=min_r,
-            maxRadius=max_r if max_r > 0 else 0,
-        )
+        img = self._get_image(start_mono=start_mono, timeout_s=timeout_s, require_fresh=require_fresh)
+        if img is None:
+            res.success = False
+            res.message = json.dumps(
+                {"overall_ok": False, "reason": "no_image", "ts_unix": time.time()}, ensure_ascii=False
+            )
+            return res
 
-        if circles is None or circles.shape[1] == 0:
-            return DetectResult(ok=False, reason="no_circles")
+        # publish "annotated" image = original image (no processing)
+        self._pub_annot.publish(img)
 
-        circles = circles[0]  # (N, 3)
-        # Basic cleanup
-        circles = np.asarray(circles, dtype=float)
+        # publish report JSON
+        report = {
+            "command": "inference",
+            "overall_ok": True,
+            "ok": True,  # convenient alias for hubs that look for ok/success
+            "reason": "stub_ok",
+            "ts_unix": time.time(),
+        }
+        s = String()
+        s.data = json.dumps(report, ensure_ascii=False)
+        self._pub_report.publish(s)
 
-        # Sort stably to avoid permutation between frames
-        circles = sort_circles_top_left_to_bottom_right(circles, y_tol=y_tol)
-
-        # If we got more than expected, keep the best subset:
-        # Here: take expected circles with smallest radius variance around median radius.
-        # (simple heuristic; replace if you have better selection logic)
-        if circles.shape[0] > expected:
-            radii = circles[:, 2]
-            med = np.median(radii)
-            idx = np.argsort(np.abs(radii - med))[:expected]
-            circles = circles[idx]
-            circles = sort_circles_top_left_to_bottom_right(circles, y_tol=y_tol)
-
-        if circles.shape[0] != expected:
-            return DetectResult(ok=False, reason=f"gears_count_mismatch:{circles.shape[0]}")
-
-        radii_vec = circles[:, 2].astype(np.float64)
-
-        if bool(self.get_parameter("radius_round").value):
-            radii_vec = np.rint(radii_vec)
-
-        # Optional sanity check
-        max_std = float(self.get_parameter("max_radius_std").value)
-        if np.std(radii_vec) > max_std:
-            return DetectResult(ok=False, reason="radius_std_too_high")
-
-        # Debug image
-        dbg = bgr.copy()
-        for (x, y, r) in circles:
-            cv2.circle(dbg, (int(round(x)), int(round(y))), int(round(r)), (0, 255, 0), 2)
-            cv2.circle(dbg, (int(round(x)), int(round(y))), 2, (0, 0, 255), 3)
-
-        return DetectResult(ok=True, reason="ok", circles=circles, vector=radii_vec, debug_img=dbg)
-
-    # -------------------------
-    # Aggregation
-    # -------------------------
-    @staticmethod
-    def _mean_vector(vectors: List[np.ndarray]) -> np.ndarray:
-        # vectors: list of (K,) float arrays
-        mat = np.vstack([v.reshape(1, -1) for v in vectors]).astype(np.float64)
-        return np.mean(mat, axis=0)
-
-    def _publish_data(self, payload: dict):
-        msg = String()
-        msg.data = json.dumps(payload, ensure_ascii=False)
-        self.pub_data.publish(msg)
-
-    def _publish_debug_image(self, dbg_bgr: np.ndarray):
-        try:
-            ros_img = self.bridge.cv2_to_imgmsg(dbg_bgr, encoding="bgr8")
-            self.pub_img.publish(ros_img)
-        except Exception as e:
-            self.get_logger().warn(f"cv2_to_imgmsg failed: {e}")
-
-    # -------------------------
-    # Services
-    # -------------------------
-    def _on_calibration(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        calib_frames = int(self.get_parameter("calib_frames").value)
-
-        accepted_vectors: List[np.ndarray] = []
-        prev_id = 0
-
-        # Initialize prev_id to current to ensure we wait for new frames
-        with self._cond:
-            prev_id = self._last_frame_id
-
-        for i in range(calib_frames):
-            ok, prev_id, img = self._wait_new_frame(prev_id, timeout_s=2.0)
-            if not ok or img is None:
-                self.get_logger().info(f"calibration: frame {i+1}/{calib_frames} timeout")
-                continue
-
-            det = self._detect_gears(img)
-            if det.ok and det.vector is not None:
-                accepted_vectors.append(det.vector)
-                self.get_logger().info(
-                    f"calibration: frame {i+1}/{calib_frames} accepted gears={self.expected_gears}"
-                )
-                if det.debug_img is not None:
-                    self._publish_debug_image(det.debug_img)
-            else:
-                # discard bad frame (do not affect computation except reducing sample count)
-                gears_info = det.reason
-                self.get_logger().info(
-                    f"calibration: frame {i+1}/{calib_frames} ignored ({gears_info})"
-                )
-                if det.debug_img is not None:
-                    self._publish_debug_image(det.debug_img)
-
-        if len(accepted_vectors) == 0:
-            response.success = False
-            response.message = "calib_no_good_frames"
-            self._calib_vector = None
-            self._publish_data({"mode": "calibration", "ok": False, "reason": response.message})
-            return response
-
-        calib_vec = self._mean_vector(accepted_vectors)
-        self._calib_vector = calib_vec
-
-        response.success = True
-        response.message = f"calib_ok n_good={len(accepted_vectors)} vector={calib_vec.tolist()}"
-        self._publish_data(
-            {"mode": "calibration", "ok": True, "n_good": len(accepted_vectors), "vector": calib_vec.tolist()}
-        )
-        return response
-
-    def _on_check(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        if self._calib_vector is None:
-            response.success = False
-            response.message = "no_calibration"
-            self._publish_data({"mode": "check", "ok": False, "reason": response.message})
-            return response
-
-        check_frames = int(self.get_parameter("check_frames").value)
-        diff_thr = float(self.get_parameter("diff_threshold").value)
-
-        accepted_vectors: List[np.ndarray] = []
-        prev_id = 0
-        with self._cond:
-            prev_id = self._last_frame_id
-
-        for i in range(check_frames):
-            ok, prev_id, img = self._wait_new_frame(prev_id, timeout_s=2.0)
-            if not ok or img is None:
-                self.get_logger().info(f"check: frame {i+1}/{check_frames} timeout")
-                continue
-
-            det = self._detect_gears(img)
-            if det.ok and det.vector is not None:
-                accepted_vectors.append(det.vector)
-                self.get_logger().info(f"check: frame {i+1}/{check_frames} accepted gears={self.expected_gears}")
-                if det.debug_img is not None:
-                    self._publish_debug_image(det.debug_img)
-            else:
-                self.get_logger().info(f"check: frame {i+1}/{check_frames} ignored ({det.reason})")
-                if det.debug_img is not None:
-                    self._publish_debug_image(det.debug_img)
-
-        if len(accepted_vectors) == 0:
-            response.success = False
-            response.message = "check_no_good_frames"
-            self._publish_data({"mode": "check", "ok": False, "reason": response.message})
-            return response
-
-        check_vec = self._mean_vector(accepted_vectors)
-
-        diffs = np.abs(check_vec - self._calib_vector)
-        is_ok = bool(np.all(diffs < diff_thr))
-
-        response.success = is_ok
-        response.message = (
-            f"check_ok n_good={len(accepted_vectors)} diffs={diffs.tolist()}"
-            if is_ok
-            else f"check_fail n_good={len(accepted_vectors)} diffs={diffs.tolist()}"
-        )
-
-        self._publish_data(
-            {
-                "mode": "check",
-                "ok": is_ok,
-                "n_good": len(accepted_vectors),
-                "calib_vector": self._calib_vector.tolist(),
-                "check_vector": check_vec.tolist(),
-                "diffs": diffs.tolist(),
-                "diff_threshold": diff_thr,
-            }
-        )
-        return response
+        res.success = True
+        res.message = "ok"
+        return res
 
 
-def main():
+def main() -> None:
     rclpy.init()
-    node = GearsCheckNode()
+    node = GearInspectorStub()
+
+    ex = MultiThreadedExecutor(num_threads=2)
+    ex.add_node(node)
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+        ex.spin()
     finally:
+        ex.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
