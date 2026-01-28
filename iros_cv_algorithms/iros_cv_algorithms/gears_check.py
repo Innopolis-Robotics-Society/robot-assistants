@@ -1,549 +1,381 @@
-# gears_check.py
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import json
-import threading
 import time
+import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import List, Optional, Tuple
 
-import cv2
 import numpy as np
+import cv2
 
 import rclpy
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
-from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-from .gear_counter import GearCounterConfig, count_teeth
+try:
+    from cv_bridge import CvBridge
+except Exception as e:
+    CvBridge = None
 
 
 @dataclass
-class Baseline:
-    expected_gears: int
-    mean_teeth: List[float]
-    tol: List[float]
-    n_samples: int
+class DetectResult:
+    ok: bool
+    reason: str
+    circles: Optional[np.ndarray] = None   # shape (N, 3) float32/float64: x, y, r
+    vector: Optional[np.ndarray] = None    # shape (expected_gears,) float64 radii (sorted)
+    debug_img: Optional[np.ndarray] = None
 
 
-class CalibrationStore:
-    def __init__(self, tol_floor: float, tol_margin: float) -> None:
-        self._tol_floor = float(tol_floor)
-        self._tol_margin = float(tol_margin)
-        self._samples: List[List[float]] = []
-        self._baseline: Optional[Baseline] = None
+def sort_circles_top_left_to_bottom_right(circles: np.ndarray, y_tol: int = 25) -> np.ndarray:
+    """
+    circles: (N, 3) -> sort by rows (y with tolerance), then by x
+    """
+    if circles is None or len(circles) == 0:
+        return circles
 
-    def reset(self) -> None:
-        self._samples.clear()
-        self._baseline = None
+    circles = np.asarray(circles, dtype=float)
 
-    def is_set(self) -> bool:
-        return self._baseline is not None
+    # First sort by y
+    idx = np.argsort(circles[:, 1])
+    circles = circles[idx]
 
-    def baseline(self) -> Optional[Baseline]:
-        return self._baseline
+    # Group by y bands
+    groups: List[np.ndarray] = []
+    current = [circles[0]]
+    for c in circles[1:]:
+        if abs(c[1] - current[-1][1]) <= y_tol:
+            current.append(c)
+        else:
+            groups.append(np.array(current))
+            current = [c]
+    groups.append(np.array(current))
 
-    def append_samples(self, samples: List[List[float]]) -> None:
-        for s in samples:
-            self._samples.append([float(x) for x in s])
-        self._recompute()
+    # Sort each group by x, then flatten
+    sorted_list = []
+    for g in groups:
+        g_idx = np.argsort(g[:, 0])
+        sorted_list.append(g[g_idx])
 
-    def _recompute(self) -> None:
-        if not self._samples:
-            self._baseline = None
-            return
-
-        m = len(self._samples[0])
-        if m == 0:
-            self._baseline = None
-            return
-
-        good = [s for s in self._samples if len(s) == m]
-        if len(good) != len(self._samples):
-            self._samples = good
-            if not self._samples:
-                self._baseline = None
-                return
-
-        arr = np.array(self._samples, dtype=np.float64)  # (n,m)
-        mean = arr.mean(axis=0)
-        dev = np.max(np.abs(arr - mean[None, :]), axis=0)
-        tol = np.maximum(self._tol_floor, dev + self._tol_margin)
-
-        self._baseline = Baseline(
-            expected_gears=int(m),
-            mean_teeth=[float(x) for x in mean.tolist()],
-            tol=[float(x) for x in tol.tolist()],
-            n_samples=int(arr.shape[0]),
-        )
-
-    def check(self, teeth: List[float]) -> Dict[str, Any]:
-        b = self._baseline
-        if b is None:
-            return {"overall_ok": False, "reason": "baseline_not_set"}
-
-        cur = [float(x) for x in teeth]
-        if len(cur) != b.expected_gears:
-            return {
-                "overall_ok": False,
-                "reason": "gear_count_mismatch",
-                "expected_gears": b.expected_gears,
-                "gears_cur": len(cur),
-                "teeth_ref": b.mean_teeth,
-                "teeth_cur": cur,
-                "tolerance": b.tol,
-            }
-
-        per_gear = []
-        ok_all = True
-        for i in range(b.expected_gears):
-            ref = float(b.mean_teeth[i])
-            tol = float(b.tol[i])
-            c = float(cur[i])
-            diff = c - ref
-            ok = abs(diff) <= tol
-            ok_all = ok_all and ok
-            per_gear.append({"index": i, "ref": ref, "cur": c, "diff": diff, "tol": tol, "ok": ok})
-
-        return {
-            "overall_ok": bool(ok_all),
-            "reason": "ok" if ok_all else "teeth_mismatch",
-            "expected_gears": b.expected_gears,
-            "teeth_ref": b.mean_teeth,
-            "teeth_cur": cur,
-            "tolerance": b.tol,
-            "per_gear": per_gear,
-        }
+    return np.vstack(sorted_list)
 
 
-class GearInspectorNode(Node):
-    def __init__(self) -> None:
+class GearsCheckNode(Node):
+    def __init__(self):
         super().__init__("gears_check")
-        self._cbg = ReentrantCallbackGroup()
-        self._bridge = CvBridge()
 
-        # ROS params
+        # -------------------------
+        # Parameters
+        # -------------------------
         self.declare_parameter("image_topic", "/image_raw")
-        self.declare_parameter("calib_samples", 5)
-        self.declare_parameter("infer_samples", 3)
-        self.declare_parameter("frame_wait_timeout_sec", 2.0)
+        self.declare_parameter("expected_gears", 4)
+        self.declare_parameter("calib_frames", 5)
+        self.declare_parameter("check_frames", 3)
 
-        # tolerance policy
-        self.declare_parameter("teeth_tol_floor", 1.0)
-        self.declare_parameter("teeth_tol_margin", 0.5)
-        self.declare_parameter("calib_min_accepted", 2)
-
-        # Algorithm params (mapped to GearCounterConfig)
-        self.declare_parameter("brighten_region", [0, 0, 550, 550])
-        self.declare_parameter("brighten_factor", 1.2)
-        self.declare_parameter("brighten_blend", True)
-        self.declare_parameter("bilateral_d", 9)
-        self.declare_parameter("bilateral_sigma_color", 75.0)
-        self.declare_parameter("bilateral_sigma_space", 75.0)
-
-        self.declare_parameter("hough_dp", 1.5)
-        self.declare_parameter("hough_min_dist", 100.0)
-        self.declare_parameter("hough_param1", 60.0)
-        self.declare_parameter("hough_param2", 60.0)
-        self.declare_parameter("hough_min_radius", 5)
-        self.declare_parameter("hough_max_radius", 25)
-
-        self.declare_parameter("use_clahe_for_hough", True)
-        self.declare_parameter("clahe_clip_limit", 2.0)
-        self.declare_parameter("clahe_tile_grid", 8)
-
-        self.declare_parameter("max_neighbor_dist", 200.0)
+        # Detection parameters
+        self.declare_parameter("blur_ksize", 7)          # odd
+        self.declare_parameter("hough_dp", 1.2)
+        self.declare_parameter("hough_min_dist", 40.0)
+        self.declare_parameter("hough_param1", 120.0)    # Canny high
+        self.declare_parameter("hough_param2", 35.0)     # accumulator threshold
+        self.declare_parameter("min_radius", 10)
+        self.declare_parameter("max_radius", 0)          # 0 = no limit
         self.declare_parameter("sort_y_tol", 25)
 
-        self.declare_parameter("big_r_min", 35)
-        self.declare_parameter("big_r_max", 300)
-        self.declare_parameter("small_r_min", 10)
-        self.declare_parameter("small_r_max", 35)
+        # Validation + comparison tolerances
+        self.declare_parameter("radius_round", True)
+        self.declare_parameter("max_radius_std", 9999.0)  # optional sanity check
+        self.declare_parameter("diff_threshold", 2.0)      # for check vs calibration (per element)
 
-        self.declare_parameter("big_r_max_from_neighbor_frac", 0.45)
-        self.declare_parameter("small_r_max_from_neighbor_frac", 0.25)
+        # IO topics
+        self.declare_parameter("out_image_topic", "~/image")
+        self.declare_parameter("out_data_topic", "~/data")
 
-        self.declare_parameter("radius_step", 1)
-        self.declare_parameter("radius_thickness", 3)
-        self.declare_parameter("radius_angles", 720)
-        self.declare_parameter("canny1", 40)
-        self.declare_parameter("canny2", 120)
-        self.declare_parameter("blur_ksize", 5)
-        self.declare_parameter("refine_subpixel", True)
-        self.declare_parameter("radius_size_penalty", 0.0)
+        self.image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
+        self.expected_gears = int(self.get_parameter("expected_gears").value)
 
-        self.declare_parameter("teeth_k1", 7.0)
-        self.declare_parameter("teeth_k2_num", 1.15)
-        self.declare_parameter("teeth_k2_den", 1.8)
+        out_image_topic = self.get_parameter("out_image_topic").get_parameter_value().string_value
+        out_data_topic = self.get_parameter("out_data_topic").get_parameter_value().string_value
 
-        # Topics
-        img_topic = str(self.get_parameter("image_topic").value)
-        self._sub = self.create_subscription(Image, img_topic, self._on_image, 10, callback_group=self._cbg)
-        self._pub_annot = self.create_publisher(Image, "~/annotated", 10)
-        self._pub_report = self.create_publisher(String, "~/report", 10)
+        # -------------------------
+        # ROS interfaces
+        # -------------------------
+        self.bridge = CvBridge() if CvBridge is not None else None
+        if self.bridge is None:
+            raise RuntimeError("cv_bridge is required but not available in this environment.")
 
-        # Services
-        self._srv_calib = self.create_service(Trigger, "~/calibration", self._srv_calibration, callback_group=self._cbg)
-        self._srv_infer = self.create_service(Trigger, "~/inference", self._srv_inference, callback_group=self._cbg)
-        self._srv_reset = self.create_service(Trigger, "~/reset", self._srv_reset, callback_group=self._cbg)
+        self.sub = self.create_subscription(Image, self.image_topic, self._on_image, 10)
+        self.pub_img = self.create_publisher(Image, out_image_topic, 10)
+        self.pub_data = self.create_publisher(String, out_data_topic, 10)
 
-        # Image buffer
-        self._img_lock = threading.Lock()
-        self._img_cv: Optional[np.ndarray] = None
-        self._img_stamp_ns: int = 0
-        self._img_cond = threading.Condition(self._img_lock)
+        self.srv_calib = self.create_service(Trigger, "~/calibration", self._on_calibration)
+        self.srv_check = self.create_service(Trigger, "~/check", self._on_check)
 
-        # Busy gate
-        self._busy_lock = threading.Lock()
-        self._busy = False
+        # -------------------------
+        # Frame synchronization
+        # -------------------------
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._last_frame_id = 0
+        self._last_cv_img: Optional[np.ndarray] = None
 
-        # Calibration store
-        tol_floor = float(self.get_parameter("teeth_tol_floor").value)
-        tol_margin = float(self.get_parameter("teeth_tol_margin").value)
-        self._calib = CalibrationStore(tol_floor=tol_floor, tol_margin=tol_margin)
+        # Calibration state
+        self._calib_vector: Optional[np.ndarray] = None
 
-        self.get_logger().info(f"gears_check started: image_topic={img_topic}")
-
-    # ---------------- image buffering ----------------
-
-    def _on_image(self, msg: Image) -> None:
-        try:
-            cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            self.get_logger().warning(f"cv_bridge convert failed: {e}")
-            return
-        stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
-        with self._img_cond:
-            self._img_cv = cv_img
-            self._img_stamp_ns = stamp_ns
-            self._img_cond.notify_all()
-
-    def _capture_burst(self, n: int) -> List[np.ndarray]:
-        n = max(1, int(n))
-        timeout = float(self.get_parameter("frame_wait_timeout_sec").value)
-        out: List[np.ndarray] = []
-
-        with self._img_cond:
-            if self._img_cv is None:
-                t0 = time.time()
-                while self._img_cv is None and (time.time() - t0) < timeout:
-                    self._img_cond.wait(timeout=0.05)
-                if self._img_cv is None:
-                    return []
-            last = self._img_stamp_ns
-            out.append(self._img_cv.copy())
-
-        for _ in range(1, n):
-            with self._img_cond:
-                t0 = time.time()
-                while self._img_stamp_ns == last and (time.time() - t0) < timeout:
-                    self._img_cond.wait(timeout=0.02)
-                last = self._img_stamp_ns
-                if self._img_cv is not None:
-                    out.append(self._img_cv.copy())
-                else:
-                    break
-        return out
-
-    # ---------------- busy gate ----------------
-
-    def _try_enter_busy(self, response: Trigger.Response) -> bool:
-        with self._busy_lock:
-            if self._busy:
-                response.success = False
-                response.message = "busy"
-                self._publish_report(
-                    {"command": "unknown", "baseline_set": self._calib.is_set(), "overall_ok": False, "reason": "busy"}
-                )
-                return False
-            self._busy = True
-            return True
-
-    def _leave_busy(self) -> None:
-        with self._busy_lock:
-            self._busy = False
-
-    # ---------------- config mapping ----------------
-
-    def _make_cfg(self) -> GearCounterConfig:
-        reg = self.get_parameter("brighten_region").value
-        if not isinstance(reg, (list, tuple)) or len(reg) != 4:
-            reg = [0, 0, 550, 550]
-
-        return GearCounterConfig(
-            brighten_region=(int(reg[0]), int(reg[1]), int(reg[2]), int(reg[3])),
-            brighten_factor=float(self.get_parameter("brighten_factor").value),
-            brighten_blend=bool(self.get_parameter("brighten_blend").value),
-            bilateral_d=int(self.get_parameter("bilateral_d").value),
-            bilateral_sigma_color=float(self.get_parameter("bilateral_sigma_color").value),
-            bilateral_sigma_space=float(self.get_parameter("bilateral_sigma_space").value),
-            hough_dp=float(self.get_parameter("hough_dp").value),
-            hough_min_dist=float(self.get_parameter("hough_min_dist").value),
-            hough_param1=float(self.get_parameter("hough_param1").value),
-            hough_param2=float(self.get_parameter("hough_param2").value),
-            hough_min_radius=int(self.get_parameter("hough_min_radius").value),
-            hough_max_radius=int(self.get_parameter("hough_max_radius").value),
-            use_clahe_for_hough=bool(self.get_parameter("use_clahe_for_hough").value),
-            clahe_clip_limit=float(self.get_parameter("clahe_clip_limit").value),
-            clahe_tile_grid=int(self.get_parameter("clahe_tile_grid").value),
-            max_neighbor_dist=float(self.get_parameter("max_neighbor_dist").value),
-            sort_y_tol=int(self.get_parameter("sort_y_tol").value),
-            big_r_min=int(self.get_parameter("big_r_min").value),
-            big_r_max=int(self.get_parameter("big_r_max").value),
-            small_r_min=int(self.get_parameter("small_r_min").value),
-            small_r_max=int(self.get_parameter("small_r_max").value),
-            big_r_max_from_neighbor_frac=float(self.get_parameter("big_r_max_from_neighbor_frac").value),
-            small_r_max_from_neighbor_frac=float(self.get_parameter("small_r_max_from_neighbor_frac").value),
-            radius_step=int(self.get_parameter("radius_step").value),
-            radius_thickness=int(self.get_parameter("radius_thickness").value),
-            radius_angles=int(self.get_parameter("radius_angles").value),
-            canny1=int(self.get_parameter("canny1").value),
-            canny2=int(self.get_parameter("canny2").value),
-            blur_ksize=int(self.get_parameter("blur_ksize").value),
-            refine_subpixel=bool(self.get_parameter("refine_subpixel").value),
-            radius_size_penalty=float(self.get_parameter("radius_size_penalty").value),
-            teeth_k1=float(self.get_parameter("teeth_k1").value),
-            teeth_k2_num=float(self.get_parameter("teeth_k2_num").value),
-            teeth_k2_den=float(self.get_parameter("teeth_k2_den").value),
+        self.get_logger().info(
+            f"gears_check started: image_topic={self.image_topic}, out_image={out_image_topic}, out_data={out_data_topic}"
         )
 
-    # ---------------- services ----------------
-
-    def _srv_reset(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        if not self._try_enter_busy(response):
-            return response
+    # -------------------------
+    # Image callback
+    # -------------------------
+    def _on_image(self, msg: Image):
         try:
-            self._calib.reset()
-            report = {"command": "reset", "baseline_set": False, "overall_ok": True, "reason": "reset_done"}
-            self._publish_report(report)
-            response.success = True
-            response.message = "reset_done"
-            return response
-        finally:
-            self._leave_busy()
-
-    def _srv_calibration(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        if not self._try_enter_busy(response):
-            return response
-        try:
-            n = int(self.get_parameter("calib_samples").value)
-            frames = self._capture_burst(n)
-            if not frames:
-                report = {"command": "calibration", "baseline_set": self._calib.is_set(), "overall_ok": False, "reason": "no_image"}
-                self._publish_report(report)
-                response.success = False
-                response.message = "no_image"
-                return response
-
-            cfg = self._make_cfg()
-
-            accepted: List[List[float]] = []
-            per_frame: List[Dict[str, Any]] = []
-            last_annot: Optional[np.ndarray] = None
-
-            for i, img in enumerate(frames, start=1):
-                res = count_teeth(img, cfg=cfg)
-                last_annot = res.annotated_bgr
-
-                if not res.ok:
-                    self.get_logger().info(f"calibration: frame {i}/{len(frames)} rejected ({res.reason})")
-                    per_frame.append({"i": i, "ok": False, "reason": res.reason, "gears": len(res.teeth)})
-                    continue
-
-                accepted.append(res.teeth)
-                per_frame.append({"i": i, "ok": True, "reason": "ok", "gears": len(res.teeth)})
-                self.get_logger().info(
-                    f"calibration: frame {i}/{len(frames)} accepted gears={len(res.teeth)} teeth={[round(t,2) for t in res.teeth]}"
-                )
-
-            if not accepted:
-                report = {"command": "calibration", "baseline_set": self._calib.is_set(), "overall_ok": False, "reason": "no_accepted_frames", "per_frame": per_frame}
-                self._publish_report(report)
-                if last_annot is not None:
-                    self._publish_annotated(self._overlay_text(last_annot, "CALIB FAIL"))
-                response.success = False
-                response.message = "no_accepted_frames"
-                return response
-
-            # Choose mode by gear count
-            counts = [len(a) for a in accepted]
-            mode_gears = max(set(counts), key=counts.count)
-            accepted_mode = [a for a in accepted if len(a) == mode_gears]
-
-            min_acc = int(self.get_parameter("calib_min_accepted").value)
-
-            # If baseline doesn't exist yet, require enough consistent samples
-            if not self._calib.is_set() and len(accepted_mode) < min_acc:
-                report = {
-                    "command": "calibration",
-                    "baseline_set": False,
-                    "overall_ok": False,
-                    "reason": "not_enough_consistent_samples",
-                    "mode_gears": mode_gears,
-                    "accepted_mode": len(accepted_mode),
-                    "need_at_least": min_acc,
-                    "per_frame": per_frame,
-                }
-                self._publish_report(report)
-                if last_annot is not None:
-                    self._publish_annotated(self._overlay_text(last_annot, "CALIB FAIL"))
-                response.success = False
-                response.message = "not_enough_consistent_samples"
-                return response
-
-            # If baseline exists, require matching expected gear count
-            if self._calib.is_set():
-                b = self._calib.baseline()
-                assert b is not None
-                accepted_mode = [a for a in accepted_mode if len(a) == b.expected_gears]
-                if not accepted_mode:
-                    report = {
-                        "command": "calibration",
-                        "baseline_set": True,
-                        "overall_ok": False,
-                        "reason": "no_samples_matching_baseline_gear_count",
-                        "expected_gears": b.expected_gears,
-                        "per_frame": per_frame,
-                    }
-                    self._publish_report(report)
-                    if last_annot is not None:
-                        self._publish_annotated(self._overlay_text(last_annot, "CALIB FAIL"))
-                    response.success = False
-                    response.message = "no_samples_matching_baseline_gear_count"
-                    return response
-
-            before_n = self._calib.baseline().n_samples if self._calib.is_set() and self._calib.baseline() else 0
-            self._calib.append_samples(accepted_mode)
-            b2 = self._calib.baseline()
-            assert b2 is not None
-
-            report = {
-                "command": "calibration",
-                "baseline_set": True,
-                "overall_ok": True,
-                "reason": "baseline_updated" if before_n > 0 else "baseline_created",
-                "expected_gears": b2.expected_gears,
-                "teeth_ref": b2.mean_teeth,
-                "tolerance": b2.tol,
-                "n_samples_total": b2.n_samples,
-                "accepted_frames": len(accepted_mode),
-                "total_frames": len(frames),
-                "per_frame": per_frame,
-            }
-            self._publish_report(report)
-            if last_annot is not None:
-                self._publish_annotated(self._overlay_text(last_annot, "CALIB OK"))
-            response.success = True
-            response.message = str(report["reason"])
-            return response
-        finally:
-            self._leave_busy()
-
-    def _srv_inference(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        if not self._try_enter_busy(response):
-            return response
-        try:
-            if not self._calib.is_set():
-                report = {"command": "inference", "baseline_set": False, "overall_ok": False, "reason": "baseline_not_set"}
-                self._publish_report(report)
-                response.success = False
-                response.message = "baseline_not_set"
-                return response
-
-            n = int(self.get_parameter("infer_samples").value)
-            frames = self._capture_burst(n)
-            if not frames:
-                report = {"command": "inference", "baseline_set": True, "overall_ok": False, "reason": "no_image"}
-                self._publish_report(report)
-                response.success = False
-                response.message = "no_image"
-                return response
-
-            cfg = self._make_cfg()
-
-            per_frame: List[Dict[str, Any]] = []
-            overall_ok = True
-            first_fail_reason = "ok"
-
-            last_annot: Optional[np.ndarray] = None
-            last_details: Dict[str, Any] = {}
-
-            for i, img in enumerate(frames, start=1):
-                res = count_teeth(img, cfg=cfg)
-                last_annot = res.annotated_bgr
-
-                if not res.ok:
-                    details = {"overall_ok": False, "reason": res.reason, "gears_cur": len(res.teeth), "debug": res.debug}
-                    frame_ok = False
-                else:
-                    details = self._calib.check(res.teeth)
-                    details["debug"] = res.debug  # keep last debug for tuning
-                    frame_ok = bool(details.get("overall_ok", False))
-
-                per_frame.append({"i": i, "ok": frame_ok, "reason": details.get("reason", "unknown")})
-                self.get_logger().info(f"inference: frame {i}/{len(frames)} ok={frame_ok} reason={details.get('reason')}")
-
-                last_details = details
-                if not frame_ok and overall_ok:
-                    overall_ok = False
-                    first_fail_reason = str(details.get("reason", "fail"))
-
-            report = {
-                "command": "inference",
-                "baseline_set": True,
-                "overall_ok": bool(overall_ok),
-                "reason": "ok" if overall_ok else first_fail_reason,
-                "per_frame": per_frame,
-            }
-            report.update(last_details)
-
-            self._publish_report(report)
-            if last_annot is not None:
-                self._publish_annotated(self._overlay_text(last_annot, "OK" if overall_ok else "FAIL"))
-
-            response.success = bool(overall_ok)
-            response.message = str(report["reason"])
-            return response
-        finally:
-            self._leave_busy()
-
-    # ---------------- publish helpers ----------------
-
-    def _publish_report(self, report: Dict[str, Any]) -> None:
-        msg = String()
-        msg.data = json.dumps(report, ensure_ascii=False)
-        self._pub_report.publish(msg)
-
-    def _publish_annotated(self, bgr: np.ndarray) -> None:
-        try:
-            msg = self._bridge.cv2_to_imgmsg(bgr, encoding="bgr8")
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
-            self.get_logger().warning(f"cv_bridge publish convert failed: {e}")
+            self.get_logger().error(f"imgmsg_to_cv2 failed: {e}")
             return
-        self._pub_annot.publish(msg)
 
+        with self._cond:
+            self._last_cv_img = cv_img
+            self._last_frame_id += 1
+            self._cond.notify_all()
+
+    def _wait_new_frame(self, prev_id: int, timeout_s: float = 2.0) -> Tuple[bool, int, Optional[np.ndarray]]:
+        deadline = time.time() + timeout_s
+        with self._cond:
+            while self._last_frame_id <= prev_id:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False, self._last_frame_id, None
+                self._cond.wait(timeout=remaining)
+            return True, self._last_frame_id, self._last_cv_img.copy() if self._last_cv_img is not None else None
+
+    # -------------------------
+    # Detection
+    # -------------------------
+    def _detect_gears(self, bgr: np.ndarray) -> DetectResult:
+        expected = int(self.get_parameter("expected_gears").value)
+
+        blur_ksize = int(self.get_parameter("blur_ksize").value)
+        blur_ksize = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
+
+        dp = float(self.get_parameter("hough_dp").value)
+        min_dist = float(self.get_parameter("hough_min_dist").value)
+        p1 = float(self.get_parameter("hough_param1").value)
+        p2 = float(self.get_parameter("hough_param2").value)
+        min_r = int(self.get_parameter("min_radius").value)
+        max_r = int(self.get_parameter("max_radius").value)
+        y_tol = int(self.get_parameter("sort_y_tol").value)
+
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        if blur_ksize > 1:
+            gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+
+        circles = cv2.HoughCircles(
+            gray,
+            cv2.HOUGH_GRADIENT,
+            dp=dp,
+            minDist=min_dist,
+            param1=p1,
+            param2=p2,
+            minRadius=min_r,
+            maxRadius=max_r if max_r > 0 else 0,
+        )
+
+        if circles is None or circles.shape[1] == 0:
+            return DetectResult(ok=False, reason="no_circles")
+
+        circles = circles[0]  # (N, 3)
+        # Basic cleanup
+        circles = np.asarray(circles, dtype=float)
+
+        # Sort stably to avoid permutation between frames
+        circles = sort_circles_top_left_to_bottom_right(circles, y_tol=y_tol)
+
+        # If we got more than expected, keep the best subset:
+        # Here: take expected circles with smallest radius variance around median radius.
+        # (simple heuristic; replace if you have better selection logic)
+        if circles.shape[0] > expected:
+            radii = circles[:, 2]
+            med = np.median(radii)
+            idx = np.argsort(np.abs(radii - med))[:expected]
+            circles = circles[idx]
+            circles = sort_circles_top_left_to_bottom_right(circles, y_tol=y_tol)
+
+        if circles.shape[0] != expected:
+            return DetectResult(ok=False, reason=f"gears_count_mismatch:{circles.shape[0]}")
+
+        radii_vec = circles[:, 2].astype(np.float64)
+
+        if bool(self.get_parameter("radius_round").value):
+            radii_vec = np.rint(radii_vec)
+
+        # Optional sanity check
+        max_std = float(self.get_parameter("max_radius_std").value)
+        if np.std(radii_vec) > max_std:
+            return DetectResult(ok=False, reason="radius_std_too_high")
+
+        # Debug image
+        dbg = bgr.copy()
+        for (x, y, r) in circles:
+            cv2.circle(dbg, (int(round(x)), int(round(y))), int(round(r)), (0, 255, 0), 2)
+            cv2.circle(dbg, (int(round(x)), int(round(y))), 2, (0, 0, 255), 3)
+
+        return DetectResult(ok=True, reason="ok", circles=circles, vector=radii_vec, debug_img=dbg)
+
+    # -------------------------
+    # Aggregation
+    # -------------------------
     @staticmethod
-    def _overlay_text(img: np.ndarray, text: str) -> np.ndarray:
-        out = img.copy()
-        cv2.putText(out, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3, cv2.LINE_AA)
-        cv2.putText(out, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 1, cv2.LINE_AA)
-        return out
+    def _mean_vector(vectors: List[np.ndarray]) -> np.ndarray:
+        # vectors: list of (K,) float arrays
+        mat = np.vstack([v.reshape(1, -1) for v in vectors]).astype(np.float64)
+        return np.mean(mat, axis=0)
+
+    def _publish_data(self, payload: dict):
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.pub_data.publish(msg)
+
+    def _publish_debug_image(self, dbg_bgr: np.ndarray):
+        try:
+            ros_img = self.bridge.cv2_to_imgmsg(dbg_bgr, encoding="bgr8")
+            self.pub_img.publish(ros_img)
+        except Exception as e:
+            self.get_logger().warn(f"cv2_to_imgmsg failed: {e}")
+
+    # -------------------------
+    # Services
+    # -------------------------
+    def _on_calibration(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        calib_frames = int(self.get_parameter("calib_frames").value)
+
+        accepted_vectors: List[np.ndarray] = []
+        prev_id = 0
+
+        # Initialize prev_id to current to ensure we wait for new frames
+        with self._cond:
+            prev_id = self._last_frame_id
+
+        for i in range(calib_frames):
+            ok, prev_id, img = self._wait_new_frame(prev_id, timeout_s=2.0)
+            if not ok or img is None:
+                self.get_logger().info(f"calibration: frame {i+1}/{calib_frames} timeout")
+                continue
+
+            det = self._detect_gears(img)
+            if det.ok and det.vector is not None:
+                accepted_vectors.append(det.vector)
+                self.get_logger().info(
+                    f"calibration: frame {i+1}/{calib_frames} accepted gears={self.expected_gears}"
+                )
+                if det.debug_img is not None:
+                    self._publish_debug_image(det.debug_img)
+            else:
+                # discard bad frame (do not affect computation except reducing sample count)
+                gears_info = det.reason
+                self.get_logger().info(
+                    f"calibration: frame {i+1}/{calib_frames} ignored ({gears_info})"
+                )
+                if det.debug_img is not None:
+                    self._publish_debug_image(det.debug_img)
+
+        if len(accepted_vectors) == 0:
+            response.success = False
+            response.message = "calib_no_good_frames"
+            self._calib_vector = None
+            self._publish_data({"mode": "calibration", "ok": False, "reason": response.message})
+            return response
+
+        calib_vec = self._mean_vector(accepted_vectors)
+        self._calib_vector = calib_vec
+
+        response.success = True
+        response.message = f"calib_ok n_good={len(accepted_vectors)} vector={calib_vec.tolist()}"
+        self._publish_data(
+            {"mode": "calibration", "ok": True, "n_good": len(accepted_vectors), "vector": calib_vec.tolist()}
+        )
+        return response
+
+    def _on_check(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        if self._calib_vector is None:
+            response.success = False
+            response.message = "no_calibration"
+            self._publish_data({"mode": "check", "ok": False, "reason": response.message})
+            return response
+
+        check_frames = int(self.get_parameter("check_frames").value)
+        diff_thr = float(self.get_parameter("diff_threshold").value)
+
+        accepted_vectors: List[np.ndarray] = []
+        prev_id = 0
+        with self._cond:
+            prev_id = self._last_frame_id
+
+        for i in range(check_frames):
+            ok, prev_id, img = self._wait_new_frame(prev_id, timeout_s=2.0)
+            if not ok or img is None:
+                self.get_logger().info(f"check: frame {i+1}/{check_frames} timeout")
+                continue
+
+            det = self._detect_gears(img)
+            if det.ok and det.vector is not None:
+                accepted_vectors.append(det.vector)
+                self.get_logger().info(f"check: frame {i+1}/{check_frames} accepted gears={self.expected_gears}")
+                if det.debug_img is not None:
+                    self._publish_debug_image(det.debug_img)
+            else:
+                self.get_logger().info(f"check: frame {i+1}/{check_frames} ignored ({det.reason})")
+                if det.debug_img is not None:
+                    self._publish_debug_image(det.debug_img)
+
+        if len(accepted_vectors) == 0:
+            response.success = False
+            response.message = "check_no_good_frames"
+            self._publish_data({"mode": "check", "ok": False, "reason": response.message})
+            return response
+
+        check_vec = self._mean_vector(accepted_vectors)
+
+        diffs = np.abs(check_vec - self._calib_vector)
+        is_ok = bool(np.all(diffs < diff_thr))
+
+        response.success = is_ok
+        response.message = (
+            f"check_ok n_good={len(accepted_vectors)} diffs={diffs.tolist()}"
+            if is_ok
+            else f"check_fail n_good={len(accepted_vectors)} diffs={diffs.tolist()}"
+        )
+
+        self._publish_data(
+            {
+                "mode": "check",
+                "ok": is_ok,
+                "n_good": len(accepted_vectors),
+                "calib_vector": self._calib_vector.tolist(),
+                "check_vector": check_vec.tolist(),
+                "diffs": diffs.tolist(),
+                "diff_threshold": diff_thr,
+            }
+        )
+        return response
 
 
-def main() -> None:
+def main():
     rclpy.init()
-    node = GearInspectorNode()
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(node)
+    node = GearsCheckNode()
     try:
-        executor.spin()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

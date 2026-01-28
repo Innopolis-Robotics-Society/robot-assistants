@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROS2 PCB Inspector Node (standalone) with robust red-anchor ROI
+ROS2 PCB Inspector Node (standalone, NO ROI)
 
-What changed vs previous version:
-- ROI detection made more robust:
-  1) Red mask = HSV red OR "redness score" (R - max(G,B)) threshold.
-  2) Candidate filtering by area + circularity + aspect ratio.
-  3) Corner selection via minAreaRect on candidate centers, then snapping each corner
-     to the nearest unused candidate (prevents picking the red LED inside the rectangle).
-  4) Stronger validation: min pairwise separation, max corner snap distance, ROI size sanity.
+Implements:
+- Services: ~/calibration, ~/inference, ~/reset  (std_srvs/Trigger)
+- Subscribes to latest frame from image_topic (sensor_msgs/Image)
+- Runs YOLO (Ultralytics) on full frame
+- Calibration:
+    * burst N frames
+    * requires identical class-count signature across accepted frames
+    * builds baseline means + per-object tolerances (dx,dy + dw/dh rel + IoU min)
+- Repeated calibration updates baseline (incremental mean + update maxima/minima)
+- Inference:
+    * burst M frames
+    * checks each frame vs baseline
+    * publishes annotated image and JSON report
 
-If ROI isn't found, check the published ~/annotated image (draw_roi_debug=True) and tune:
-- anchor_s_min, anchor_v_min
-- anchor_redness_thr, anchor_min_area_px
-- anchor_near_corner_max_px, anchor_min_sep_px
+Notes:
+- Matching is by (class, sorted by x then y) index inside class.
+- No timing constraints; service calls are rejected if node is busy.
 """
 
 from __future__ import annotations
@@ -29,7 +34,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-import math
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -47,20 +51,11 @@ from std_srvs.srv import Trigger
 @dataclass(frozen=True)
 class Det:
     cls: str
-    x: float  # center x in ROI crop norm [0..1]
-    y: float  # center y in ROI crop norm [0..1]
-    w: float  # width  in ROI crop norm [0..1]
-    h: float  # height in ROI crop norm [0..1]
+    x: float  # center x in [0..1]
+    y: float  # center y in [0..1]
+    w: float  # width  in [0..1]
+    h: float  # height in [0..1]
     conf: float
-
-
-@dataclass(frozen=True)
-class ROI:
-    x0: int
-    y0: int
-    w: int
-    h: int
-    quad: np.ndarray  # shape (4,2) float32 in full-image pixels, ordered TL,TR,BR,BL
 
 
 @dataclass
@@ -87,16 +82,15 @@ class BaselineEntry:
     iou_min: float = 0.0
 
 
+# ----------------------------- math utils -----------------------------
+
+
 def _rel_diff(a: float, b: float, eps: float = 1e-9) -> float:
     return abs(a - b) / max(abs(a), eps)
 
 
 def _xywh_to_xyxy(x: float, y: float, w: float, h: float) -> Tuple[float, float, float, float]:
-    x1 = x - w / 2.0
-    y1 = y - h / 2.0
-    x2 = x + w / 2.0
-    y2 = y + h / 2.0
-    return x1, y1, x2, y2
+    return x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0
 
 
 def _iou_xywh(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
@@ -131,49 +125,35 @@ def _median(vals: List[float]) -> float:
     return float((s[mid - 1] + s[mid]) / 2.0)
 
 
-def _order_quad_points(pts: np.ndarray) -> np.ndarray:
-    """
-    Order 4 points into TL, TR, BR, BL for image coords (x right, y down).
-    """
-    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
-    s = pts[:, 0] + pts[:, 1]
-    d = pts[:, 0] - pts[:, 1]
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmax(d)]
-    bl = pts[np.argmin(d)]
-    return np.stack([tl, tr, br, bl], axis=0).astype(np.float32)
-
-
 # ----------------------------- node -----------------------------
 
 
 class PCBInspectorNode(Node):
     def __init__(self) -> None:
         super().__init__("pcb_inspector")
-
         self._cbg = ReentrantCallbackGroup()
         self._bridge = CvBridge()
 
-        # Parameters
+        # Topics / IO (as requested)
         self.declare_parameter("image_topic", "/image_raw")
 
-        # YOLO
-        self.declare_parameter("model_path", "/home/mobile/ros2_ws/src/iros_cv_algorithms/iros_cv_algorithms/algos/models/yolo11s_best.pt")
+        # YOLO (as requested)
+        self.declare_parameter(
+            "model_path",
+            "/home/mobile/ros2_ws/src/iros_cv_algorithms/iros_cv_algorithms/algos/models/yolo11s_best.pt",
+        )
         self.declare_parameter("conf_thr", 0.25)
         self.declare_parameter("iou_thr", 0.50)
         self.declare_parameter("device", "0")
 
-        # Burst sizes
+        # Burst
         self.declare_parameter("calib_samples", 5)
         self.declare_parameter("infer_samples", 3)
 
-        # Floors (minimum tolerances) in ROI-normalized coordinates
-        self.declare_parameter("min_pos_tol", 0.01)   # dx/dy
-        self.declare_parameter("min_size_tol", 0.25)  # relative w/h error
+        # Tolerances (normalized coords)
+        self.declare_parameter("min_pos_tol", 0.01)
+        self.declare_parameter("min_size_tol", 0.25)
         self.declare_parameter("min_iou", 0.75)
-
-        # Margins
         self.declare_parameter("pos_margin", 0.005)
         self.declare_parameter("size_margin", 0.05)
         self.declare_parameter("iou_margin", 0.05)
@@ -181,40 +161,15 @@ class PCBInspectorNode(Node):
         # Frame wait
         self.declare_parameter("frame_wait_timeout_sec", 2.0)
 
-        # Anchor/ROI detection params (tune these first)
-        self.declare_parameter("anchor_min_area_px", 150)      # if too high -> not_enough_red_blobs
-        self.declare_parameter("anchor_max_area_px", 200000)
-        self.declare_parameter("anchor_circularity_min", 0.25) # lower if anchors are not circular
-        self.declare_parameter("anchor_aspect_max", 2.0)
-        self.declare_parameter("anchor_topk", 20)
+        # Publishing toggles
+        self.declare_parameter("draw_expected_boxes", True)
 
-        # HSV thresholds
-        self.declare_parameter("anchor_h_lo1", 0)
-        self.declare_parameter("anchor_h_hi1", 25)
-        self.declare_parameter("anchor_h_lo2", 160)
-        self.declare_parameter("anchor_h_hi2", 179)
-        self.declare_parameter("anchor_s_min", 60)
-        self.declare_parameter("anchor_v_min", 40)
-
-        # Redness score thresholds (BGR)
-        self.declare_parameter("anchor_redness_thr", 50)  # threshold on (R - max(G,B))
-        self.declare_parameter("anchor_r_min", 60)        # minimal R channel
-
-        # Geometry validation
-        self.declare_parameter("anchor_min_sep_px", 25)         # min distance between chosen corners
-        self.declare_parameter("anchor_near_corner_max_px", 80) # max distance to snap rect corner to candidate
-        self.declare_parameter("roi_margin_px", 10)
-        self.declare_parameter("roi_min_area_frac", 0.05)
-
-        self.declare_parameter("draw_roi_debug", True)
-
-        # Topics
+        # ROS entities
         img_topic = str(self.get_parameter("image_topic").value)
         self._sub = self.create_subscription(Image, img_topic, self._on_image, 10, callback_group=self._cbg)
         self._pub_annot = self.create_publisher(Image, "~/annotated", 10)
         self._pub_report = self.create_publisher(String, "~/report", 10)
 
-        # Services
         self._srv_calib = self.create_service(Trigger, "~/calibration", self._srv_calibration, callback_group=self._cbg)
         self._srv_infer = self.create_service(Trigger, "~/inference", self._srv_inference, callback_group=self._cbg)
         self._srv_reset = self.create_service(Trigger, "~/reset", self._srv_reset, callback_group=self._cbg)
@@ -227,9 +182,9 @@ class PCBInspectorNode(Node):
 
         # Busy gate
         self._busy_lock = threading.Lock()
-        self._busy: bool = False
+        self._busy = False
 
-        # Baseline state (ROI-normalized)
+        # Baseline
         self._base_lock = threading.Lock()
         self._baseline: Optional[Dict[str, List[BaselineEntry]]] = None
         self._baseline_counts: Optional[Dict[str, int]] = None
@@ -248,7 +203,7 @@ class PCBInspectorNode(Node):
 
         self.get_logger().info(f"PCBInspector started: image_topic={img_topic}, model={model_path}, device={self._device}")
 
-    # ------------------------- ROS callbacks -------------------------
+    # ------------------------- ROS image buffer -------------------------
 
     def _on_image(self, msg: Image) -> None:
         try:
@@ -261,6 +216,51 @@ class PCBInspectorNode(Node):
             self._img_cv = cv_img
             self._img_stamp_ns = stamp_ns
             self._img_cond.notify_all()
+
+    def _capture_burst(self, n: int) -> List[np.ndarray]:
+        n = max(1, int(n))
+        out: List[np.ndarray] = []
+        timeout = float(self.get_parameter("frame_wait_timeout_sec").value)
+
+        with self._img_cond:
+            if self._img_cv is None:
+                t0 = time.time()
+                while self._img_cv is None and (time.time() - t0) < timeout:
+                    self._img_cond.wait(timeout=0.05)
+                if self._img_cv is None:
+                    return []
+            last_stamp = self._img_stamp_ns
+            out.append(self._img_cv.copy())
+
+        for _ in range(1, n):
+            with self._img_cond:
+                t0 = time.time()
+                while self._img_stamp_ns == last_stamp and (time.time() - t0) < timeout:
+                    self._img_cond.wait(timeout=0.02)
+                last_stamp = self._img_stamp_ns
+                if self._img_cv is not None:
+                    out.append(self._img_cv.copy())
+                else:
+                    break
+        return out
+
+    # ------------------------- Busy gate -------------------------
+
+    def _try_enter_busy(self, response: Trigger.Response) -> bool:
+        with self._busy_lock:
+            if self._busy:
+                response.success = False
+                response.message = "busy"
+                self._publish_report({"command": "unknown", "baseline_set": self._baseline_is_set(), "overall_ok": False, "reason": "busy"})
+                return False
+            self._busy = True
+            return True
+
+    def _leave_busy(self) -> None:
+        with self._busy_lock:
+            self._busy = False
+
+    # ------------------------- Services -------------------------
 
     def _srv_reset(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         if not self._try_enter_busy(response):
@@ -281,8 +281,7 @@ class PCBInspectorNode(Node):
         if not self._try_enter_busy(response):
             return response
         try:
-            n = int(self.get_parameter("calib_samples").value)
-            frames = self._capture_burst(n)
+            frames = self._capture_burst(int(self.get_parameter("calib_samples").value))
             if not frames:
                 report = {"command": "calibration", "baseline_set": self._baseline_is_set(), "overall_ok": False, "reason": "no_image"}
                 self._publish_report(report)
@@ -319,8 +318,7 @@ class PCBInspectorNode(Node):
                 response.message = "baseline_not_set"
                 return response
 
-            n = int(self.get_parameter("infer_samples").value)
-            frames = self._capture_burst(n)
+            frames = self._capture_burst(int(self.get_parameter("infer_samples").value))
             if not frames:
                 report = {"command": "inference", "baseline_set": True, "overall_ok": False, "reason": "no_image"}
                 self._publish_report(report)
@@ -339,223 +337,11 @@ class PCBInspectorNode(Node):
         finally:
             self._leave_busy()
 
-    # ------------------------- busy gate -------------------------
+    # ------------------------- YOLO inference (full frame) -------------------------
 
-    def _try_enter_busy(self, response: Trigger.Response) -> bool:
-        with self._busy_lock:
-            if self._busy:
-                response.success = False
-                response.message = "busy"
-                self._publish_report({"command": "unknown", "baseline_set": self._baseline_is_set(), "overall_ok": False, "reason": "busy"})
-                return False
-            self._busy = True
-            return True
-
-    def _leave_busy(self) -> None:
-        with self._busy_lock:
-            self._busy = False
-
-    # ------------------------- frame capture -------------------------
-
-    def _capture_burst(self, n: int) -> List[np.ndarray]:
-        n = max(1, int(n))
-        out: List[np.ndarray] = []
-        timeout = float(self.get_parameter("frame_wait_timeout_sec").value)
-
-        with self._img_cond:
-            if self._img_cv is None:
-                t0 = time.time()
-                while self._img_cv is None and (time.time() - t0) < timeout:
-                    self._img_cond.wait(timeout=0.05)
-                if self._img_cv is None:
-                    return []
-            last_stamp = self._img_stamp_ns
-            out.append(self._img_cv.copy())
-
-        for _ in range(1, n):
-            with self._img_cond:
-                t0 = time.time()
-                while self._img_stamp_ns == last_stamp and (time.time() - t0) < timeout:
-                    self._img_cond.wait(timeout=0.02)
-                last_stamp = self._img_stamp_ns
-                if self._img_cv is not None:
-                    out.append(self._img_cv.copy())
-                else:
-                    break
-        return out
-
-    # ------------------------- anchor ROI detection (robust) -------------------------
-
-    def _detect_roi(self, image_bgr: np.ndarray) -> Tuple[Optional[ROI], Dict[str, Any]]:
-        H, W = image_bgr.shape[:2]
-        dbg: Dict[str, Any] = {}
-
-        # ---- Build red mask: HSV OR redness score ----
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-
-        h_lo1 = int(self.get_parameter("anchor_h_lo1").value)
-        h_hi1 = int(self.get_parameter("anchor_h_hi1").value)
-        h_lo2 = int(self.get_parameter("anchor_h_lo2").value)
-        h_hi2 = int(self.get_parameter("anchor_h_hi2").value)
-        s_min = int(self.get_parameter("anchor_s_min").value)
-        v_min = int(self.get_parameter("anchor_v_min").value)
-
-        lower1 = np.array([h_lo1, s_min, v_min], dtype=np.uint8)
-        upper1 = np.array([h_hi1, 255, 255], dtype=np.uint8)
-        lower2 = np.array([h_lo2, s_min, v_min], dtype=np.uint8)
-        upper2 = np.array([h_hi2, 255, 255], dtype=np.uint8)
-
-        mask_hsv = cv2.bitwise_or(cv2.inRange(hsv, lower1, upper1), cv2.inRange(hsv, lower2, upper2))
-
-        b, g, r = cv2.split(image_bgr)
-        redness_thr = int(self.get_parameter("anchor_redness_thr").value)
-        r_min = int(self.get_parameter("anchor_r_min").value)
-        redness = cv2.subtract(r, cv2.max(b, g))  # uint8, saturates at 0
-        mask_redness = cv2.inRange(redness, redness_thr, 255)
-        mask_rmin = cv2.inRange(r, r_min, 255)
-        mask_bgr = cv2.bitwise_and(mask_redness, mask_rmin)
-
-        mask = cv2.bitwise_or(mask_hsv, mask_bgr)
-
-        # ---- Morphology ----
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
-
-        # ---- Contours -> candidates ----
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_a = int(self.get_parameter("anchor_min_area_px").value)
-        max_a = int(self.get_parameter("anchor_max_area_px").value)
-        circ_min = float(self.get_parameter("anchor_circularity_min").value)
-        asp_max = float(self.get_parameter("anchor_aspect_max").value)
-        topk = int(self.get_parameter("anchor_topk").value)
-
-        candidates: List[Tuple[float, float, float]] = []  # (cx, cy, area)
-        for c in contours:
-            area = float(cv2.contourArea(c))
-            if area < min_a or area > max_a:
-                continue
-
-            per = float(cv2.arcLength(c, True))
-            if per <= 1e-6:
-                continue
-            circularity = float(4.0 * np.pi * area / (per * per))
-
-            x, y, ww, hh = cv2.boundingRect(c)
-            aspect = float(max(ww, hh) / max(min(ww, hh), 1))
-
-            if circularity < circ_min:
-                continue
-            if aspect > asp_max:
-                continue
-
-            M = cv2.moments(c)
-            if abs(M.get("m00", 0.0)) < 1e-6:
-                continue
-            cx = float(M["m10"] / M["m00"])
-            cy = float(M["m01"] / M["m00"])
-            candidates.append((cx, cy, area))
-
-        candidates.sort(key=lambda t: t[2], reverse=True)
-        candidates = candidates[:max(4, topk)]
-
-        dbg["anchors_candidates"] = len(candidates)
-        dbg["cand_pts"] = [[float(c[0]), float(c[1]), float(c[2])] for c in candidates[:30]]
-
-        if len(candidates) < 4:
-            dbg["reason"] = "not_enough_red_blobs"
-            return None, dbg
-
-        pts = np.array([[c[0], c[1]] for c in candidates], dtype=np.float32)
-
-        # ---- Corner selection via minAreaRect + snap to nearest candidates ----
-        rect = cv2.minAreaRect(pts.reshape(-1, 1, 2))
-        box = cv2.boxPoints(rect).astype(np.float32)  # 4 corners of fitted rectangle
-        box = _order_quad_points(box)
-
-        snap_max = float(self.get_parameter("anchor_near_corner_max_px").value)
-        chosen: List[np.ndarray] = []
-        used = np.zeros((len(pts),), dtype=bool)
-
-        for corner in box:
-            d2 = np.sum((pts - corner[None, :]) ** 2, axis=1)
-            order = np.argsort(d2)
-            sel = None
-            for idx in order:
-                if used[idx]:
-                    continue
-                dist = float(math.sqrt(float(d2[idx])))
-                if dist <= snap_max:
-                    sel = idx
-                    break
-            if sel is None:
-                dbg["reason"] = "no_candidate_near_rect_corner"
-                dbg["rect_box"] = box.tolist()
-                return None, dbg
-            used[sel] = True
-            chosen.append(pts[sel])
-
-        quad = _order_quad_points(np.stack(chosen, axis=0))
-
-        # ---- Validate distinct corners ----
-        min_sep = float(self.get_parameter("anchor_min_sep_px").value)
-        for i in range(4):
-            for j in range(i + 1, 4):
-                if float(np.linalg.norm(quad[i] - quad[j])) < min_sep:
-                    dbg["reason"] = "corner_points_not_distinct"
-                    dbg["roi_quad"] = quad.tolist()
-                    return None, dbg
-
-        # ---- BBox ROI around quad ----
-        x_min = int(np.floor(np.min(quad[:, 0])))
-        y_min = int(np.floor(np.min(quad[:, 1])))
-        x_max = int(np.ceil(np.max(quad[:, 0])))
-        y_max = int(np.ceil(np.max(quad[:, 1])))
-
-        margin = int(self.get_parameter("roi_margin_px").value)
-        x_min = max(0, x_min - margin)
-        y_min = max(0, y_min - margin)
-        x_max = min(W - 1, x_max + margin)
-        y_max = min(H - 1, y_max + margin)
-
-        roi_w = max(1, x_max - x_min + 1)
-        roi_h = max(1, y_max - y_min + 1)
-
-        min_frac = float(self.get_parameter("roi_min_area_frac").value)
-        if (roi_w * roi_h) < (min_frac * W * H):
-            dbg["reason"] = "roi_too_small_probably_false_anchor"
-            dbg["roi_bbox"] = [x_min, y_min, roi_w, roi_h]
-            dbg["roi_quad"] = quad.tolist()
-            return None, dbg
-
-        roi = ROI(x0=x_min, y0=y_min, w=roi_w, h=roi_h, quad=quad)
-        dbg["roi_bbox"] = [roi.x0, roi.y0, roi.w, roi.h]
-        dbg["roi_quad"] = quad.tolist()
-        dbg["reason"] = "ok"
-        return roi, dbg
-
-    def _crop_and_mask_roi(self, image_bgr: np.ndarray, roi: ROI) -> np.ndarray:
-        crop = image_bgr[roi.y0:roi.y0 + roi.h, roi.x0:roi.x0 + roi.w].copy()
-
-        poly = roi.quad.copy()
-        poly[:, 0] -= float(roi.x0)
-        poly[:, 1] -= float(roi.y0)
-        poly_i = np.round(poly).astype(np.int32).reshape((-1, 1, 2))
-
-        mask = np.zeros((roi.h, roi.w), dtype=np.uint8)
-        cv2.fillPoly(mask, [poly_i], 255)
-
-        return cv2.bitwise_and(crop, crop, mask=mask)
-
-    # ------------------------- YOLO inference within ROI -------------------------
-
-    def _infer_in_roi(self, image_bgr: np.ndarray, roi: ROI) -> List[Det]:
-        crop = self._crop_and_mask_roi(image_bgr, roi)
-
+    def _infer(self, image_bgr: np.ndarray) -> List[Det]:
         results = self._model.predict(
-            source=crop,
+            source=image_bgr,
             conf=self._conf_thr,
             iou=self._nms_iou_thr,
             device=self._device,
@@ -610,7 +396,34 @@ class PCBInspectorNode(Node):
         be.dh_rel_tol = max(min_size_tol, be.max_dh_rel + size_margin)
         be.iou_min = max(min_iou, be.min_iou - iou_margin)
 
-    # ------------------------- translation alignment in ROI coords -------------------------
+    def _estimate_translation_from_baseline(self, sig: Dict[str, List[Det]]) -> Tuple[float, float]:
+        with self._base_lock:
+            baseline = self._baseline
+            base_counts = self._baseline_counts
+        if baseline is None or base_counts is None:
+            return 0.0, 0.0
+        if self._counts(sig) != base_counts:
+            return 0.0, 0.0
+
+        dxs: List[float] = []
+        dys: List[float] = []
+        for cls, entries in baseline.items():
+            cur_list = sig.get(cls, [])
+            for i, be in enumerate(entries):
+                if i >= len(cur_list):
+                    continue
+                dxs.append(cur_list[i].x - be.mean.x)
+                dys.append(cur_list[i].y - be.mean.y)
+        return _median(dxs), _median(dys)
+
+    @staticmethod
+    def _apply_translation(sig: Dict[str, List[Det]], tx: float, ty: float) -> Dict[str, List[Det]]:
+        if abs(tx) < 1e-12 and abs(ty) < 1e-12:
+            return sig
+        out: Dict[str, List[Det]] = {}
+        for cls, lst in sig.items():
+            out[cls] = [Det(cls=d.cls, x=d.x - tx, y=d.y - ty, w=d.w, h=d.h, conf=d.conf) for d in lst]
+        return out
 
     @staticmethod
     def _estimate_translation_between(ref_sig: Dict[str, List[Det]], cur_sig: Dict[str, List[Det]], counts: Dict[str, int]) -> Tuple[float, float]:
@@ -626,84 +439,34 @@ class PCBInspectorNode(Node):
                 dys.append(c[i].y - r[i].y)
         return _median(dxs), _median(dys)
 
-    @staticmethod
-    def _apply_translation(sig: Dict[str, List[Det]], tx: float, ty: float) -> Dict[str, List[Det]]:
-        if abs(tx) < 1e-12 and abs(ty) < 1e-12:
-            return sig
-        out: Dict[str, List[Det]] = {}
-        for cls, lst in sig.items():
-            out[cls] = [Det(cls=d.cls, x=d.x - tx, y=d.y - ty, w=d.w, h=d.h, conf=d.conf) for d in lst]
-        return out
-
-    def _estimate_translation_from_baseline(self, sig: Dict[str, List[Det]]) -> Tuple[float, float]:
-        with self._base_lock:
-            baseline = self._baseline
-            base_counts = self._baseline_counts
-        if baseline is None or base_counts is None:
-            return 0.0, 0.0
-        cur_counts = self._counts(sig)
-        if cur_counts != base_counts:
-            return 0.0, 0.0
-        dxs: List[float] = []
-        dys: List[float] = []
-        for cls, entries in baseline.items():
-            cur_list = sig.get(cls, [])
-            for i, be in enumerate(entries):
-                if i >= len(cur_list):
-                    continue
-                dxs.append(cur_list[i].x - be.mean.x)
-                dys.append(cur_list[i].y - be.mean.y)
-        return _median(dxs), _median(dys)
-
-    # ------------------------- calibration (build/update) -------------------------
+    # ------------------------- calibration -------------------------
 
     def _calibration_build(self, frames: List[np.ndarray]) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
         self.get_logger().info(f"calibration(build): frames={len(frames)}")
 
         sigs: List[Dict[str, List[Det]]] = []
         counts_list: List[Dict[str, int]] = []
-        rois_ok: List[bool] = []
-        dbg_last: Dict[str, Any] = {}
         last_annot: Optional[np.ndarray] = None
 
         for i, img in enumerate(frames, start=1):
-            roi, dbg = self._detect_roi(img)
-            dbg_last = dbg
-            if roi is None:
-                self.get_logger().info(f"calibration(build): frame {i}/{len(frames)} ROI not found ({dbg.get('reason')})")
-                sigs.append({})
-                counts_list.append({})
-                rois_ok.append(False)
-                last_annot = self._draw_roi_debug(img, roi=None, dbg=dbg)
-                continue
-
-            dets = self._infer_in_roi(img, roi)
-            sig = self._signature(dets)
+            sig = self._signature(self._infer(img))
             counts = self._counts(sig)
             sigs.append(sig)
             counts_list.append(counts)
-            rois_ok.append(True)
-
             self.get_logger().info(f"calibration(build): frame {i}/{len(frames)} counts={counts}")
-            last_annot = self._draw_overlay(img, roi, sig, baseline=None, base_counts=None,
-                                           mismatches=[], missing=[], extra=[], tx=0.0, ty=0.0, roi_dbg=dbg)
+            last_annot = self._draw_overlay(img, sig, None, None, [], [], [], 0.0, 0.0)
 
         def key_of(c: Dict[str, int]) -> Tuple[Tuple[str, int], ...]:
             return tuple(sorted(c.items()))
 
-        idx_valid = [i for i, ok in enumerate(rois_ok) if ok]
-        if not idx_valid:
-            report = {"command": "calibration", "baseline_set": False, "overall_ok": False, "reason": "roi_not_found_all_frames", "roi_debug_last": dbg_last}
-            return False, report, last_annot
-
         freq: Dict[Tuple[Tuple[str, int], ...], int] = {}
-        for i in idx_valid:
-            k = key_of(counts_list[i])
+        for c in counts_list:
+            k = key_of(c)
             freq[k] = freq.get(k, 0) + 1
 
-        mode_key = max(freq.items(), key=lambda kv: kv[1])[0]
+        mode_key, mode_n = max(freq.items(), key=lambda kv: kv[1])
         base_counts = dict(mode_key)
-        good_idx = [i for i in idx_valid if key_of(counts_list[i]) == mode_key]
+        good_idx = [i for i, c in enumerate(counts_list) if key_of(c) == mode_key]
 
         if len(good_idx) < 2:
             report = {
@@ -714,7 +477,6 @@ class PCBInspectorNode(Node):
                 "mode_counts": base_counts,
                 "mode_have": len(good_idx),
                 "need_at_least": 2,
-                "roi_debug_last": dbg_last,
             }
             return False, report, last_annot
 
@@ -734,6 +496,7 @@ class PCBInspectorNode(Node):
             ys = np.zeros((len(aligned_sigs), cnt), dtype=np.float64)
             ws = np.zeros((len(aligned_sigs), cnt), dtype=np.float64)
             hs = np.zeros((len(aligned_sigs), cnt), dtype=np.float64)
+
             for si, sig in enumerate(aligned_sigs):
                 lst = sig.get(cls, [])
                 for k in range(cnt):
@@ -742,10 +505,12 @@ class PCBInspectorNode(Node):
                     ys[si, k] = d.y
                     ws[si, k] = d.w
                     hs[si, k] = d.h
+
             mean_x = xs.mean(axis=0)
             mean_y = ys.mean(axis=0)
             mean_w = ws.mean(axis=0)
             mean_h = hs.mean(axis=0)
+
             entries: List[BaselineEntry] = []
             for k in range(cnt):
                 be = BaselineEntry(mean=BoxMean(float(mean_x[k]), float(mean_y[k]), float(mean_w[k]), float(mean_h[k])))
@@ -785,38 +550,27 @@ class PCBInspectorNode(Node):
             "counts_ref": base_counts,
             "accepted_frames": len(good_idx),
             "total_frames": len(frames),
+            "mode_frequency": mode_n,
         }
         return True, report, last_annot
 
     def _calibration_update(self, frames: List[np.ndarray]) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
         self.get_logger().info(f"calibration(update): frames={len(frames)}")
-
         with self._base_lock:
             base_counts = dict(self._baseline_counts or {})
 
         accepted = 0
         rejected = 0
-        roi_fail = 0
-
         last_annot: Optional[np.ndarray] = None
-        last_details: Dict[str, Any] = {}
 
         for i, img in enumerate(frames, start=1):
-            roi, dbg = self._detect_roi(img)
-            if roi is None:
-                roi_fail += 1
-                self.get_logger().info(f"calibration(update): frame {i}/{len(frames)} ROI not found ({dbg.get('reason')})")
-                last_annot = self._draw_roi_debug(img, roi=None, dbg=dbg)
-                continue
-
-            sig = self._signature(self._infer_in_roi(img, roi))
+            sig = self._signature(self._infer(img))
             cur_counts = self._counts(sig)
 
             if cur_counts != base_counts:
                 rejected += 1
                 self.get_logger().info(f"calibration(update): frame {i}/{len(frames)} rejected counts={cur_counts} ref={base_counts}")
-                last_annot = self._draw_overlay(img, roi, sig, baseline=None, base_counts=base_counts,
-                                               mismatches=[], missing=[], extra=[], tx=0.0, ty=0.0, roi_dbg=dbg)
+                last_annot = self._draw_overlay(img, sig, None, base_counts, [], [], [], 0.0, 0.0)
                 continue
 
             tx, ty = self._estimate_translation_from_baseline(sig)
@@ -825,9 +579,8 @@ class PCBInspectorNode(Node):
             accepted += 1
             self.get_logger().info(f"calibration(update): frame {i}/{len(frames)} accepted tx={tx:.6f} ty={ty:.6f}")
 
-            ok, details, annot = self._check_and_annotate(img, roi, sig, roi_dbg=dbg)
+            ok, details, annot = self._check_and_annotate(img, sig)
             last_annot = annot
-            last_details = details
 
         ok_final = accepted > 0
         report = {
@@ -838,10 +591,8 @@ class PCBInspectorNode(Node):
             "counts_ref": base_counts,
             "accepted_frames": accepted,
             "rejected_frames": rejected,
-            "roi_fail_frames": roi_fail,
             "total_frames": len(frames),
         }
-        report.update(last_details)
         return ok_final, report, last_annot
 
     def _update_baseline_with_sample(self, sig_aligned: Dict[str, List[Det]]) -> None:
@@ -891,19 +642,10 @@ class PCBInspectorNode(Node):
         last_details: Dict[str, Any] = {}
 
         for i, img in enumerate(frames, start=1):
-            roi, dbg = self._detect_roi(img)
-            if roi is None:
-                ok = False
-                details = {"reason": "roi_not_found", "roi_debug": dbg}
-                annot = self._draw_roi_debug(img, roi=None, dbg=dbg)
-                per_frame.append({"i": i, "ok": False, "reason": "roi_not_found"})
-                self.get_logger().info(f"inference: frame {i}/{len(frames)} ROI not found ({dbg.get('reason')})")
-            else:
-                sig = self._signature(self._infer_in_roi(img, roi))
-                ok, details, annot = self._check_and_annotate(img, roi, sig, roi_dbg=dbg)
-                per_frame.append({"i": i, "ok": bool(ok), "reason": details.get("reason", "unknown")})
-                self.get_logger().info(f"inference: frame {i}/{len(frames)} ok={ok} reason={details.get('reason')}")
-
+            sig = self._signature(self._infer(img))
+            ok, details, annot = self._check_and_annotate(img, sig)
+            per_frame.append({"i": i, "ok": bool(ok), "reason": details.get("reason", "unknown")})
+            self.get_logger().info(f"inference: frame {i}/{len(frames)} ok={ok} reason={details.get('reason')}")
             last_annot = annot
             last_details = details
 
@@ -921,16 +663,13 @@ class PCBInspectorNode(Node):
         report.update(last_details)
         return overall_ok, report, last_annot
 
-    def _check_and_annotate(
-        self, image_bgr: np.ndarray, roi: ROI, sig: Dict[str, List[Det]], roi_dbg: Dict[str, Any]
-    ) -> Tuple[bool, Dict[str, Any], Optional[np.ndarray]]:
+    def _check_and_annotate(self, image_bgr: np.ndarray, sig: Dict[str, List[Det]]) -> Tuple[bool, Dict[str, Any], np.ndarray]:
         with self._base_lock:
             baseline = self._baseline
             base_counts = self._baseline_counts
 
         if baseline is None or base_counts is None:
-            annot = self._draw_overlay(image_bgr, roi, sig, baseline=None, base_counts=None,
-                                      mismatches=[], missing=[], extra=[], tx=0.0, ty=0.0, roi_dbg=roi_dbg)
+            annot = self._draw_overlay(image_bgr, sig, None, None, [], [], [], 0.0, 0.0)
             return False, {"reason": "baseline_not_set"}, annot
 
         cur_counts = self._counts(sig)
@@ -1000,9 +739,6 @@ class PCBInspectorNode(Node):
             "counts_ref": base_counts,
             "counts_cur": cur_counts,
             "tx_ty": {"tx": tx, "ty": ty},
-            "roi_bbox": [roi.x0, roi.y0, roi.w, roi.h],
-            "roi_quad": roi.quad.tolist(),
-            "roi_debug": roi_dbg,
         }
         if missing:
             details["missing"] = missing
@@ -1011,63 +747,14 @@ class PCBInspectorNode(Node):
         if mismatches:
             details["mismatches"] = mismatches[:50]
 
-        annot = self._draw_overlay(image_bgr, roi, sig, baseline=baseline, base_counts=base_counts,
-                                   mismatches=mismatches, missing=missing, extra=extra, tx=tx, ty=ty, roi_dbg=roi_dbg)
+        annot = self._draw_overlay(image_bgr, sig, baseline, base_counts, mismatches, missing, extra, tx, ty)
         return ok, details, annot
 
     # ------------------------- visualization -------------------------
 
-    def _draw_roi_debug(self, img: np.ndarray, roi: Optional[ROI], dbg: Dict[str, Any]) -> np.ndarray:
-        out = img.copy()
-        if not bool(self.get_parameter("draw_roi_debug").value):
-            return out
-
-        txt = f"ROI: {'OK' if roi is not None else 'FAIL'} reason={dbg.get('reason','')} cand={dbg.get('anchors_candidates',0)}"
-        cv2.putText(out, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-
-        # draw candidate centers (magenta)
-        cand = dbg.get("cand_pts", [])
-        for c in cand[:30]:
-            x, y = int(round(c[0])), int(round(c[1]))
-            cv2.circle(out, (x, y), 5, (255, 0, 255), -1)
-
-        bbox = dbg.get("roi_bbox", None)
-        if bbox and isinstance(bbox, list) and len(bbox) == 4:
-            x0, y0, w, h = bbox
-            cv2.rectangle(out, (int(x0), int(y0)), (int(x0 + w), int(y0 + h)), (255, 255, 0), 2)
-
-        quad = dbg.get("roi_quad", None)
-        if quad and isinstance(quad, list) and len(quad) == 4:
-            q = np.array(quad, dtype=np.int32).reshape(4, 2)
-            cv2.polylines(out, [q.reshape(-1, 1, 2)], True, (0, 255, 255), 3)
-            for i, (x, y) in enumerate(q):
-                cv2.circle(out, (int(x), int(y)), 7, (0, 255, 255), -1)
-                cv2.putText(out, f"{i}", (int(x) + 8, int(y) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
-
-        return out
-
-    @staticmethod
-    def _px_from_roi(det: Det, roi: ROI) -> Tuple[int, int, int, int]:
-        x1, y1, x2, y2 = _xywh_to_xyxy(det.x, det.y, det.w, det.h)
-        x1p = int(round(roi.x0 + x1 * roi.w))
-        y1p = int(round(roi.y0 + y1 * roi.h))
-        x2p = int(round(roi.x0 + x2 * roi.w))
-        y2p = int(round(roi.y0 + y2 * roi.h))
-        return x1p, y1p, x2p, y2p
-
-    @staticmethod
-    def _px_from_roi_mean(m: BoxMean, roi: ROI) -> Tuple[int, int, int, int]:
-        x1, y1, x2, y2 = _xywh_to_xyxy(m.x, m.y, m.w, m.h)
-        x1p = int(round(roi.x0 + x1 * roi.w))
-        y1p = int(round(roi.y0 + y1 * roi.h))
-        x2p = int(round(roi.x0 + x2 * roi.w))
-        y2p = int(round(roi.y0 + y2 * roi.h))
-        return x1p, y1p, x2p, y2p
-
     def _draw_overlay(
         self,
         img: np.ndarray,
-        roi: ROI,
         sig: Dict[str, List[Det]],
         baseline: Optional[Dict[str, List[BaselineEntry]]],
         base_counts: Optional[Dict[str, int]],
@@ -1076,68 +763,75 @@ class PCBInspectorNode(Node):
         extra: List[Dict[str, Any]],
         tx: float,
         ty: float,
-        roi_dbg: Dict[str, Any],
     ) -> np.ndarray:
         out = img.copy()
+        H, W = out.shape[:2]
 
-        # ROI polygon
-        q = roi.quad.astype(np.int32).reshape(4, 2)
-        cv2.polylines(out, [q.reshape(-1, 1, 2)], True, (0, 255, 255), 3)
-
-        # expected baseline boxes
-        if baseline is not None:
+        # expected baseline boxes (yellow)
+        if baseline is not None and bool(self.get_parameter("draw_expected_boxes").value):
             for cls, entries in baseline.items():
                 for i, be in enumerate(entries):
-                    x1, y1, x2, y2 = self._px_from_roi_mean(be.mean, roi)
-                    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                    cv2.putText(out, f"EXP {cls}[{i}]", (x1, y2 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+                    x1, y1, x2, y2 = _xywh_to_xyxy(be.mean.x, be.mean.y, be.mean.w, be.mean.h)
+                    x1p = int(round(x1 * W))
+                    y1p = int(round(y1 * H))
+                    x2p = int(round(x2 * W))
+                    y2p = int(round(y2 * H))
+                    cv2.rectangle(out, (x1p, y1p), (x2p, y2p), (0, 255, 255), 2)
+                    cv2.putText(out, f"EXP {cls}[{i}]", (x1p, y2p + 14),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
         bad_set = {(m["class"], int(m["index"])) for m in mismatches}
 
-        # current detections
+        # current detections (green/red)
         for cls, lst in sig.items():
             for i, d in enumerate(lst):
-                x1, y1, x2, y2 = self._px_from_roi(d, roi)
+                x1, y1, x2, y2 = _xywh_to_xyxy(d.x, d.y, d.w, d.h)
+                x1p = int(round(x1 * W))
+                y1p = int(round(y1 * H))
+                x2p = int(round(x2 * W))
+                y2p = int(round(y2 * H))
+
                 if (cls, i) in bad_set:
                     color = (0, 0, 255)
                     tag = "BAD"
                 else:
                     color = (0, 255, 0)
                     tag = "OK"
-                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(out, f"{tag} {cls}[{i}] {d.conf:.2f}", (x1, max(0, y1 - 5)),
+
+                cv2.rectangle(out, (x1p, y1p), (x2p, y2p), color, 2)
+                cv2.putText(out, f"{tag} {cls}[{i}] {d.conf:.2f}", (x1p, max(0, y1p - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-        # missing
+        # missing (expected box in red)
         if baseline is not None:
             for m in missing:
                 cls = str(m["class"])
                 idx = int(m["index"])
                 be_list = baseline.get(cls, [])
                 if 0 <= idx < len(be_list):
-                    x1, y1, x2, y2 = self._px_from_roi_mean(be_list[idx].mean, roi)
-                    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                    cv2.putText(out, f"MISSING {cls}[{idx}]", (x1, max(0, y1 - 5)),
+                    be = be_list[idx]
+                    x1, y1, x2, y2 = _xywh_to_xyxy(be.mean.x, be.mean.y, be.mean.w, be.mean.h)
+                    x1p = int(round(x1 * W))
+                    y1p = int(round(y1 * H))
+                    x2p = int(round(x2 * W))
+                    y2p = int(round(y2 * H))
+                    cv2.rectangle(out, (x1p, y1p), (x2p, y2p), (0, 0, 255), 3)
+                    cv2.putText(out, f"MISSING {cls}[{idx}]", (x1p, max(0, y1p - 5)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
 
-        # extra
+        # extra (orange)
         for e in extra:
-            d = Det(cls=str(e["class"]), x=float(e["x"]), y=float(e["y"]), w=float(e["w"]), h=float(e["h"]),
-                    conf=float(e.get("conf", 0.0)))
-            x1, y1, x2, y2 = self._px_from_roi(d, roi)
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 165, 255), 3)
-            cv2.putText(out, f"EXTRA {d.cls} {d.conf:.2f}", (x1, y2 + 18),
+            x1, y1, x2, y2 = _xywh_to_xyxy(float(e["x"]), float(e["y"]), float(e["w"]), float(e["h"]))
+            x1p = int(round(x1 * W))
+            y1p = int(round(y1 * H))
+            x2p = int(round(x2 * W))
+            y2p = int(round(y2 * H))
+            cv2.rectangle(out, (x1p, y1p), (x2p, y2p), (0, 165, 255), 3)
+            cv2.putText(out, f"EXTRA {e['class']} {float(e.get('conf', 0.0)):.2f}", (x1p, y2p + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2, cv2.LINE_AA)
 
-        cv2.putText(out, f"align tx={tx:.6f} ty={ty:.6f}", (10, out.shape[0] - 10),
+        cv2.putText(out, f"align tx={tx:.6f} ty={ty:.6f}", (10, H - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
-        # also draw candidate points (magenta) for quick tuning
-        if bool(self.get_parameter("draw_roi_debug").value):
-            cand = roi_dbg.get("cand_pts", [])
-            for c in cand[:30]:
-                x, y = int(round(c[0])), int(round(c[1]))
-                cv2.circle(out, (x, y), 4, (255, 0, 255), -1)
 
         return out
 

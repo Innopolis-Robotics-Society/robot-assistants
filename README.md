@@ -162,6 +162,8 @@ ros2 launch iros_camera camera.launch.py cameras:=mook_laptop_camera
 
 ### AprilTags (for a specific camera namespace)
 
+/home/mobile/ros2_ws/src/iros_cv_algorithms/iros_cv_algorithms/algos/models/yolo11s_best.pt
+
 ```bash
 ros2 launch iros_april_tags detect_apriltags.launch.py camera:=mook_laptop_camera
 ```
