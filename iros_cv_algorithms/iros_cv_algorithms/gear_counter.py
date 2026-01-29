@@ -1,468 +1,681 @@
-# gear_counter.py
 from __future__ import annotations
 
-import math
+import json
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
 
+import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+
+from .gear_counter import GearCounterConfig, count_teeth
+
+
+# -----------------------------
+# Baseline store
+# -----------------------------
 @dataclass
-class GearCounterConfig:
-    # Preprocess
-    brighten_region: Tuple[int, int, int, int] = (0, 0, 550, 550)  # (x1,y1,x2,y2)
-    brighten_factor: float = 1.2
-    brighten_blend: bool = True
-    bilateral_d: int = 9
-    bilateral_sigma_color: float = 75.0
-    bilateral_sigma_space: float = 75.0
-
-    # Hough small circles (gear centers)
-    hough_dp: float = 1.5
-    hough_min_dist: float = 100.0
-    hough_param1: float = 60.0
-    hough_param2: float = 60.0
-    hough_min_radius: int = 5
-    hough_max_radius: int = 25
-
-    # Improve Hough stability
-    use_clahe_for_hough: bool = True
-    clahe_clip_limit: float = 2.0
-    clahe_tile_grid: int = 8
-
-    # Filter: drop isolated centers
-    max_neighbor_dist: float = 200.0
-
-    # Sorting
-    sort_y_tol: int = 25
-
-    # Radius search for big/small circle (edge-based)
-    big_r_min: int = 35
-    big_r_max: int = 300
-    small_r_min: int = 10
-    small_r_max: int = 35
-
-    # FIX: limit r_max by nearest neighbor distance (prevents too-big radii)
-    big_r_max_from_neighbor_frac: float = 0.45
-    small_r_max_from_neighbor_frac: float = 0.25
-
-    radius_step: int = 1
-    radius_thickness: int = 3
-    radius_angles: int = 720
-    canny1: int = 40
-    canny2: int = 120
-    blur_ksize: int = 5
-    refine_subpixel: bool = True
-
-    # Optional penalty to avoid sticking to large radii (0 = off)
-    radius_size_penalty: float = 0.0
-
-    # Teeth formula
-    teeth_k1: float = 7.0
-    teeth_k2_num: float = 1.15
-    teeth_k2_den: float = 1.8
+class Baseline:
+    expected_gears: int
+    mean_teeth: List[float]       # baseline mean
+    stat_tol: List[float]         # informational tolerance from baseline history
+    n_samples: int                # number of calibration sessions appended
 
 
-@dataclass
-class GearCountResult:
-    ok: bool
-    reason: str
-    teeth: List[float]
-    centers: List[Tuple[int, int]]
-    r_big: List[float]
-    r_small: List[float]
-    preprocessed_bgr: np.ndarray
-    annotated_bgr: np.ndarray
-    debug: Dict[str, Any]
-
-
-def brighten_region(image: np.ndarray, region, factor: float = 1.5, blend: bool = True) -> np.ndarray:
-    if isinstance(region, tuple) and len(region) == 4:
-        x1, y1, x2, y2 = region
-        x1, y1 = max(0, int(x1)), max(0, int(y1))
-        x2, y2 = min(int(x2), image.shape[1]), min(int(y2), image.shape[0])
-
-        if blend:
-            mask = np.zeros(image.shape[:2], dtype=np.float32)
-            mask[y1:y2, x1:x2] = 1.0
-            kernel_size = max(3, min(x2 - x1, y2 - y1) // 10)
-            kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-            mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), 0)
-        else:
-            mask = np.zeros(image.shape[:2], dtype=np.float32)
-            mask[y1:y2, x1:x2] = 1.0
-    else:
-        mask = region.astype(np.float32) / 255.0
-
-    brightened = cv2.convertScaleAbs(image, alpha=factor, beta=0)
-
-    result = image.astype(np.float32)
-    brightened = brightened.astype(np.float32)
-    for c in range(3):
-        result[:, :, c] = result[:, :, c] * (1 - mask) + brightened[:, :, c] * mask
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def blur(img: np.ndarray, d: int = 9, sigma_color: float = 75, sigma_space: float = 75) -> np.ndarray:
-    return cv2.bilateralFilter(img, int(d), float(sigma_color), float(sigma_space))
-
-
-def filter_circles_by_max_distance(circles_array, max_allowed_distance: float):
-    """Remove circles whose nearest neighbor is farther than max_allowed_distance."""
-    if circles_array is None or len(circles_array[0]) <= 1:
-        return circles_array
-
-    circles = circles_array[0].copy()
-    filtered = []
-
-    for i, (x1, y1, r1) in enumerate(circles):
-        min_dist = float("inf")
-        for j, (x2, y2, _r2) in enumerate(circles):
-            if i == j:
-                continue
-            dist = math.hypot(float(x2 - x1), float(y2 - y1))
-            if dist < min_dist:
-                min_dist = dist
-        if min_dist <= max_allowed_distance:
-            filtered.append([x1, y1, r1])
-
-    return np.array([filtered]) if filtered else None
-
-
-def sort_circles(circles, y_tol: int = 25) -> np.ndarray:
+class CalibrationStore:
     """
-    Return circles as (N,3) sorted roughly top-left to bottom-right.
-    Accepts: None, (1,N,3), (N,3), (3,)
+    Stores baseline as mean over appended calibration sessions.
+    Each calibration service call appends ONE averaged vector (mean over good frames).
     """
-    if circles is None:
-        return np.empty((0, 3), dtype=np.float32)
+    def __init__(self, tol_floor: float, tol_margin: float) -> None:
+        self._tol_floor = float(tol_floor)
+        self._tol_margin = float(tol_margin)
+        self._samples: List[List[float]] = []
+        self._baseline: Optional[Baseline] = None
 
-    c = np.asarray(circles)
+    def reset(self) -> None:
+        self._samples.clear()
+        self._baseline = None
 
-    if c.ndim == 3 and c.shape[-1] == 3:
-        c = c[0]
-    elif c.ndim == 1 and c.size == 3:
-        c = c.reshape(1, 3)
-    elif c.ndim == 2 and c.shape[1] == 3:
-        pass
-    else:
-        raise ValueError(f"Unexpected circles shape: {c.shape}")
+    def is_set(self) -> bool:
+        return self._baseline is not None
 
-    if c.size == 0:
-        return np.empty((0, 3), dtype=np.float32)
+    def baseline(self) -> Optional[Baseline]:
+        return self._baseline
 
-    x = np.rint(c[:, 0]).astype(np.int32)
-    y = np.rint(c[:, 1]).astype(np.int32)
-    r = c[:, 2].astype(np.float32)
+    def append_sample(self, sample: List[float]) -> None:
+        self._samples.append([float(x) for x in sample])
+        self._recompute()
 
-    row = (y // max(1, int(y_tol))).astype(np.int32)
-    order = np.lexsort((x, y, row))
-    return np.stack([x[order], y[order], r[order]], axis=1).astype(np.float32)
+    def _recompute(self) -> None:
+        if not self._samples:
+            self._baseline = None
+            return
 
+        m = len(self._samples[0])
+        if m == 0:
+            self._baseline = None
+            return
 
-def _bilinear_sample(img: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
-    """img: (H,W) float32, xs/ys float coords, out-of-bounds -> 0"""
-    h, w = img.shape
-    x0 = np.floor(xs).astype(np.int32)
-    y0 = np.floor(ys).astype(np.int32)
-    x1 = x0 + 1
-    y1 = y0 + 1
+        # keep only same-length samples
+        good = [s for s in self._samples if len(s) == m]
+        if len(good) != len(self._samples):
+            self._samples = good
+            if not self._samples:
+                self._baseline = None
+                return
 
-    wx = xs - x0
-    wy = ys - y0
+        arr = np.array(self._samples, dtype=np.float64)  # (n,m)
+        mean = arr.mean(axis=0)
 
-    def inb(x, y):
-        return (x >= 0) & (x < w) & (y >= 0) & (y < h)
+        # informational tolerance from max deviation + margin, floored
+        dev = np.max(np.abs(arr - mean[None, :]), axis=0)
+        stat_tol = np.maximum(self._tol_floor, dev + self._tol_margin)
 
-    m00 = inb(x0, y0)
-    m10 = inb(x1, y0)
-    m01 = inb(x0, y1)
-    m11 = inb(x1, y1)
-
-    out = np.zeros_like(xs, dtype=np.float32)
-
-    if np.any(m00):
-        out[m00] += img[y0[m00], x0[m00]] * (1 - wx[m00]) * (1 - wy[m00])
-    if np.any(m10):
-        out[m10] += img[y0[m10], x1[m10]] * wx[m10] * (1 - wy[m10])
-    if np.any(m01):
-        out[m01] += img[y1[m01], x0[m01]] * (1 - wx[m01]) * wy[m01]
-    if np.any(m11):
-        out[m11] += img[y1[m11], x1[m11]] * wx[m11] * wy[m11]
-
-    return out
+        self._baseline = Baseline(
+            expected_gears=int(m),
+            mean_teeth=[float(x) for x in mean.tolist()],
+            stat_tol=[float(x) for x in stat_tol.tolist()],
+            n_samples=int(arr.shape[0]),
+        )
 
 
-def find_best_circle_radius(
-    image: np.ndarray,
-    center_xy: Tuple[float, float],
-    r_min: int,
-    r_max: Optional[int],
-    step: int = 1,
-    thickness: int = 2,
-    angles: int = 720,
-    blur_ksize: int = 5,
-    canny1: int = 50,
-    canny2: int = 150,
-    refine_subpixel: bool = True,
-    size_penalty: float = 0.0,
-) -> Tuple[float, Dict[str, Any]]:
-    if image.ndim == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image.copy()
+# -----------------------------
+# Node
+# -----------------------------
+class GearInspectorNode(Node):
+    def __init__(self) -> None:
+        super().__init__("gears_check")
+        self._cbg = ReentrantCallbackGroup()
+        self._bridge = CvBridge()
 
-    if gray.dtype != np.uint8:
-        g = np.clip(gray.astype(np.float32), 0, 255)
-        gray_u8 = g.astype(np.uint8)
-    else:
-        gray_u8 = gray
+        # ROS I/O
+        self.declare_parameter("image_topic", "/image_raw")
+        self.declare_parameter("frame_wait_timeout_sec", 2.0)
 
-    if blur_ksize and blur_ksize >= 3 and blur_ksize % 2 == 1:
-        gray_u8 = cv2.GaussianBlur(gray_u8, (blur_ksize, blur_ksize), 0)
+        # Samples per command
+        self.declare_parameter("calib_samples", 5)
+        self.declare_parameter("infer_samples", 5)
 
-    edges = cv2.Canny(gray_u8, int(canny1), int(canny2)).astype(np.float32) / 255.0
-    h, w = edges.shape
-    cx, cy = float(center_xy[0]), float(center_xy[1])
+        # Inference: keep reading stream until first good frame is found (limits)
+        self.declare_parameter("infer_find_timeout_sec", 5.0)  # seconds
+        self.declare_parameter("infer_max_attempts", 50)       # frames
 
-    if r_max is None:
-        r_max = int(min(cx, cy, (w - 1) - cx, (h - 1) - cy))
-    r_max = max(int(r_min), int(r_max))
+        # Accept only frames with exactly this gear count
+        self.declare_parameter("required_gears", 4)
 
-    radii = np.arange(int(r_min), int(r_max) + 1, int(step), dtype=np.float32)
-    if radii.size == 0:
-        raise ValueError("Empty radius range. Check r_min/r_max/step.")
+        # Kept for compatibility (NOT used)
+        self.declare_parameter("calib_consensus_tol", 1.0)
+        self.declare_parameter("calib_consensus_need", 3)
+        self.declare_parameter("infer_consensus_tol", 1.0)
+        self.declare_parameter("infer_consensus_need", 3)
 
-    thetas = np.linspace(0.0, 2.0 * np.pi, int(angles), endpoint=False, dtype=np.float32)
-    cos_t = np.cos(thetas)
-    sin_t = np.sin(thetas)
+        # Final compare tolerance vs baseline
+        self.declare_parameter("baseline_abs_tol", 2.0)
 
-    thickness = max(1, int(thickness))
-    half = thickness // 2
-    offsets = np.arange(-half, half + 1, dtype=np.float32)
+        # Baseline statistical info tolerances
+        self.declare_parameter("teeth_tol_floor", 1.0)
+        self.declare_parameter("teeth_tol_margin", 0.5)
 
-    scores = np.zeros_like(radii, dtype=np.float32)
-    for i, r in enumerate(radii):
-        acc = 0.0
-        cnt = 0
-        for dr in offsets:
-            rr = r + dr
-            if rr <= 0:
-                continue
-            xs = cx + rr * cos_t
-            ys = cy + rr * sin_t
-            vals = _bilinear_sample(edges, xs, ys)
-            acc += float(vals.mean())
-            cnt += 1
-        scores[i] = acc / max(1, cnt)
+        # Output topics
+        self.declare_parameter("out_image_topic", "~/image")
+        self.declare_parameter("out_data_topic", "~/data")
 
-    # Optional: penalize very large radii
-    if size_penalty and size_penalty > 0.0 and r_max > 0:
-        rr = radii / float(r_max)  # 0..1
-        scores = scores / (1.0 + float(size_penalty) * (rr * rr))
+        # ---------------- Algorithm params (mapped to GearCounterConfig) ----------------
+        self.declare_parameter("brighten_region", [0, 0, 550, 550])
+        self.declare_parameter("brighten_factor", 1.2)
+        self.declare_parameter("brighten_blend", True)
+        self.declare_parameter("bilateral_d", 9)
+        self.declare_parameter("bilateral_sigma_color", 75.0)
+        self.declare_parameter("bilateral_sigma_space", 75.0)
 
-    best_idx = int(np.argmax(scores))
-    best_r = float(radii[best_idx])
-    best_score = float(scores[best_idx])
+        self.declare_parameter("hough_dp", 1.5)
+        self.declare_parameter("hough_min_dist", 100.0)
+        self.declare_parameter("hough_param1", 60.0)
+        self.declare_parameter("hough_param2", 60.0)
+        self.declare_parameter("hough_min_radius", 5)
+        self.declare_parameter("hough_max_radius", 25)
 
-    # Subpixel refinement (parabola fit)
-    if refine_subpixel and 0 < best_idx < len(radii) - 1:
-        y0, y1, y2 = scores[best_idx - 1], scores[best_idx], scores[best_idx + 1]
-        denom = float(y0 - 2.0 * y1 + y2)
-        if abs(denom) > 1e-8:
-            delta = 0.5 * float(y0 - y2) / denom
-            delta = float(np.clip(delta, -1.0, 1.0))
-            best_r = float(radii[best_idx] + delta * int(step))
+        self.declare_parameter("use_clahe_for_hough", True)
+        self.declare_parameter("clahe_clip_limit", 2.0)
+        self.declare_parameter("clahe_tile_grid", 8)
 
-    info = {"best_idx": best_idx, "best_score": best_score, "r_min": int(r_min), "r_max": int(r_max)}
-    return best_r, info
+        self.declare_parameter("max_neighbor_dist", 200.0)
+        self.declare_parameter("sort_y_tol", 25)
+
+        self.declare_parameter("big_r_min", 35)
+        self.declare_parameter("big_r_max", 300)
+        self.declare_parameter("small_r_min", 10)
+        self.declare_parameter("small_r_max", 35)
+
+        self.declare_parameter("big_r_max_from_neighbor_frac", 0.45)
+        self.declare_parameter("small_r_max_from_neighbor_frac", 0.25)
+
+        self.declare_parameter("radius_step", 1)
+        self.declare_parameter("radius_thickness", 3)
+        self.declare_parameter("radius_angles", 720)
+        self.declare_parameter("canny1", 40)
+        self.declare_parameter("canny2", 120)
+        self.declare_parameter("blur_ksize", 5)
+        self.declare_parameter("refine_subpixel", True)
+        self.declare_parameter("radius_size_penalty", 0.0)
+
+        self.declare_parameter("teeth_k1", 7.0)
+        self.declare_parameter("teeth_k2_num", 1.15)
+        self.declare_parameter("teeth_k2_den", 1.8)
+
+        # Topics
+        img_topic = str(self.get_parameter("image_topic").value)
+        out_img_topic = str(self.get_parameter("out_image_topic").value)
+        out_data_topic = str(self.get_parameter("out_data_topic").value)
+
+        # IMPORTANT: sensor_data QoS to match camera streams
+        self._sub = self.create_subscription(
+            Image,
+            img_topic,
+            self._on_image,
+            qos_profile_sensor_data,
+            callback_group=self._cbg
+        )
+        self._pub_img = self.create_publisher(Image, out_img_topic, 10)
+        self._pub_data = self.create_publisher(String, out_data_topic, 10)
+
+        # Services
+        self._srv_calib = self.create_service(Trigger, "~/calibration", self._srv_calibration, callback_group=self._cbg)
+        self._srv_infer = self.create_service(Trigger, "~/inference", self._srv_inference, callback_group=self._cbg)
+        self._srv_reset = self.create_service(Trigger, "~/reset", self._srv_reset, callback_group=self._cbg)
+
+        # Image buffer
+        self._img_lock = threading.Lock()
+        self._img_cv: Optional[np.ndarray] = None
+        self._img_stamp_ns: int = 0
+        self._img_cond = threading.Condition(self._img_lock)
+
+        # Busy gate
+        self._busy_lock = threading.Lock()
+        self._busy = False
+
+        # Baseline store
+        tol_floor = float(self.get_parameter("teeth_tol_floor").value)
+        tol_margin = float(self.get_parameter("teeth_tol_margin").value)
+        self._calib = CalibrationStore(tol_floor=tol_floor, tol_margin=tol_margin)
+
+        self.get_logger().info(
+            f"gears_check started: image_topic={img_topic}, out_image={out_img_topic}, out_data={out_data_topic}"
+        )
+
+    # ---------------- report formatting ----------------
+    def _mk_report(self, command: str, *, ok: bool, reason: str, **extra) -> Dict[str, Any]:
+        base = {
+            "command": command,
+            "baseline_set": bool(self._calib.is_set()),
+            "ok": bool(ok),
+            "reason": str(reason),
+        }
+        base.update(extra)
+        return base
+
+    # ---------------- image buffering ----------------
+    def _on_image(self, msg: Image) -> None:
+        try:
+            cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            self.get_logger().warning(f"cv_bridge convert failed: {e}")
+            return
+        stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
+        with self._img_cond:
+            self._img_cv = cv_img
+            self._img_stamp_ns = stamp_ns
+            self._img_cond.notify_all()
+
+    def _capture_burst(self, n: int) -> List[np.ndarray]:
+        """
+        Capture N frames from the stream. Frames are considered "new" when stamp changes.
+        """
+        n = max(1, int(n))
+        timeout = float(self.get_parameter("frame_wait_timeout_sec").value)
+        out: List[np.ndarray] = []
+
+        with self._img_cond:
+            if self._img_cv is None:
+                t0 = time.time()
+                while self._img_cv is None and (time.time() - t0) < timeout:
+                    self._img_cond.wait(timeout=0.05)
+                if self._img_cv is None:
+                    return []
+            last = self._img_stamp_ns
+            out.append(self._img_cv.copy())
+
+        for _ in range(1, n):
+            with self._img_cond:
+                t0 = time.time()
+                while self._img_stamp_ns == last and (time.time() - t0) < timeout:
+                    self._img_cond.wait(timeout=0.02)
+                last = self._img_stamp_ns
+                if self._img_cv is not None:
+                    out.append(self._img_cv.copy())
+                else:
+                    break
+        return out
+
+    def _wait_next_frame(self, last_stamp_ns: int, timeout_sec: float) -> Optional[np.ndarray]:
+        """
+        Wait for the next frame (stamp changes). Returns BGR image or None.
+        """
+        with self._img_cond:
+            t0 = time.time()
+            while self._img_cv is None and (time.time() - t0) < timeout_sec:
+                self._img_cond.wait(timeout=0.05)
+            if self._img_cv is None:
+                return None
+
+            while self._img_stamp_ns == last_stamp_ns and (time.time() - t0) < timeout_sec:
+                self._img_cond.wait(timeout=0.02)
+
+            if self._img_cv is None:
+                return None
+            return self._img_cv.copy()
+
+    # ---------------- busy gate ----------------
+    def _try_enter_busy(self, response: Trigger.Response, command: str) -> bool:
+        with self._busy_lock:
+            if self._busy:
+                response.success = False
+                response.message = "busy"
+                self._publish_report(self._mk_report(command, ok=False, reason="busy"))
+                return False
+            self._busy = True
+            return True
+
+    def _leave_busy(self) -> None:
+        with self._busy_lock:
+            self._busy = False
+
+    # ---------------- config mapping ----------------
+    def _make_cfg(self) -> GearCounterConfig:
+        reg = self.get_parameter("brighten_region").value
+        if not isinstance(reg, (list, tuple)) or len(reg) != 4:
+            reg = [0, 0, 550, 550]
+
+        return GearCounterConfig(
+            brighten_region=(int(reg[0]), int(reg[1]), int(reg[2]), int(reg[3])),
+            brighten_factor=float(self.get_parameter("brighten_factor").value),
+            brighten_blend=bool(self.get_parameter("brighten_blend").value),
+            bilateral_d=int(self.get_parameter("bilateral_d").value),
+            bilateral_sigma_color=float(self.get_parameter("bilateral_sigma_color").value),
+            bilateral_sigma_space=float(self.get_parameter("bilateral_sigma_space").value),
+            hough_dp=float(self.get_parameter("hough_dp").value),
+            hough_min_dist=float(self.get_parameter("hough_min_dist").value),
+            hough_param1=float(self.get_parameter("hough_param1").value),
+            hough_param2=float(self.get_parameter("hough_param2").value),
+            hough_min_radius=int(self.get_parameter("hough_min_radius").value),
+            hough_max_radius=int(self.get_parameter("hough_max_radius").value),
+            use_clahe_for_hough=bool(self.get_parameter("use_clahe_for_hough").value),
+            clahe_clip_limit=float(self.get_parameter("clahe_clip_limit").value),
+            clahe_tile_grid=int(self.get_parameter("clahe_tile_grid").value),
+            max_neighbor_dist=float(self.get_parameter("max_neighbor_dist").value),
+            sort_y_tol=int(self.get_parameter("sort_y_tol").value),
+            big_r_min=int(self.get_parameter("big_r_min").value),
+            big_r_max=int(self.get_parameter("big_r_max").value),
+            small_r_min=int(self.get_parameter("small_r_min").value),
+            small_r_max=int(self.get_parameter("small_r_max").value),
+            big_r_max_from_neighbor_frac=float(self.get_parameter("big_r_max_from_neighbor_frac").value),
+            small_r_max_from_neighbor_frac=float(self.get_parameter("small_r_max_from_neighbor_frac").value),
+            radius_step=int(self.get_parameter("radius_step").value),
+            radius_thickness=int(self.get_parameter("radius_thickness").value),
+            radius_angles=int(self.get_parameter("radius_angles").value),
+            canny1=int(self.get_parameter("canny1").value),
+            canny2=int(self.get_parameter("canny2").value),
+            blur_ksize=int(self.get_parameter("blur_ksize").value),
+            refine_subpixel=bool(self.get_parameter("refine_subpixel").value),
+            radius_size_penalty=float(self.get_parameter("radius_size_penalty").value),
+            teeth_k1=float(self.get_parameter("teeth_k1").value),
+            teeth_k2_num=float(self.get_parameter("teeth_k2_num").value),
+            teeth_k2_den=float(self.get_parameter("teeth_k2_den").value),
+        )
+
+    # ---------------- mean over good frames ----------------
+    @staticmethod
+    def _mean_vectors(vectors: List[List[float]]) -> List[float]:
+        arr = np.array(vectors, dtype=np.float64)  # (n,m)
+        mean = arr.mean(axis=0)
+        return [float(x) for x in mean.tolist()]
+
+    # ---------------- publish helpers ----------------
+    def _publish_report(self, report: Dict[str, Any]) -> None:
+        msg = String()
+        msg.data = json.dumps(report, ensure_ascii=False)
+        self._pub_data.publish(msg)
+
+    def _publish_image(self, bgr: np.ndarray) -> None:
+        try:
+            msg = self._bridge.cv2_to_imgmsg(bgr, encoding="bgr8")
+        except Exception as e:
+            self.get_logger().warning(f"cv_bridge publish convert failed: {e}")
+            return
+        self._pub_img.publish(msg)
+
+    @staticmethod
+    def _overlay_text(img: np.ndarray, text: str) -> np.ndarray:
+        out = img.copy()
+        cv2.putText(out, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(out, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 1, cv2.LINE_AA)
+        return out
+
+    # ---------------- services ----------------
+    def _srv_reset(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        if not self._try_enter_busy(response, "reset"):
+            return response
+        try:
+            self._calib.reset()
+            report = self._mk_report("reset", ok=True, reason="reset_done")
+            self._publish_report(report)
+            response.success = True
+            response.message = "reset_done"
+            return response
+        finally:
+            self._leave_busy()
+
+    def _srv_calibration(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        if not self._try_enter_busy(response, "calibration"):
+            return response
+        try:
+            required_gears = int(self.get_parameter("required_gears").value)
+
+            # baseline gear count must match
+            if self._calib.is_set():
+                b0 = self._calib.baseline()
+                if b0 is not None and b0.expected_gears != required_gears:
+                    report = self._mk_report(
+                        "calibration",
+                        ok=False,
+                        reason="baseline_expected_gears_mismatch_required_gears",
+                        expected_gears=b0.expected_gears,
+                        required_gears=required_gears,
+                    )
+                    self._publish_report(report)
+                    response.success = False
+                    response.message = "baseline_expected_gears_mismatch_required_gears"
+                    return response
+
+            n = int(self.get_parameter("calib_samples").value)
+            frames = self._capture_burst(n)
+            if not frames:
+                report = self._mk_report("calibration", ok=False, reason="no_image")
+                self._publish_report(report)
+                response.success = False
+                response.message = "no_image"
+                return response
+
+            cfg = self._make_cfg()
+
+            per_frame: List[Dict[str, Any]] = []
+            good_vectors: List[List[float]] = []
+            last_annot: Optional[np.ndarray] = None
+
+            for i, img in enumerate(frames, start=1):
+                res = count_teeth(img, cfg=cfg)
+                last_annot = res.annotated_bgr
+
+                if not res.ok:
+                    self.get_logger().info(f"calibration: frame {i}/{len(frames)} rejected ({res.reason})")
+                    per_frame.append({"i": i, "ok": False, "reason": res.reason, "gears": len(res.teeth), "teeth": []})
+                    continue
+
+                gears = len(res.teeth)
+                if gears != required_gears:
+                    self.get_logger().info(f"calibration: frame {i}/{len(frames)} ignored (gears={gears} != {required_gears})")
+                    per_frame.append({"i": i, "ok": False, "reason": "gears_not_required", "gears": gears, "teeth": []})
+                    continue
+
+                vec = [float(x) for x in res.teeth]
+                good_vectors.append(vec)
+                per_frame.append({"i": i, "ok": True, "reason": "ok", "gears": gears, "teeth": vec})
+                self.get_logger().info(f"calibration: frame {i}/{len(frames)} accepted gears={gears}")
+
+            # SUCCESS if >= 1 good frame
+            if not good_vectors:
+                report = self._mk_report(
+                    "calibration",
+                    ok=False,
+                    reason="no_frames_with_required_gears",
+                    required_gears=required_gears,
+                    per_frame=per_frame,
+                )
+                self._publish_report(report)
+                if last_annot is not None:
+                    self._publish_image(self._overlay_text(last_annot, "CALIB FAIL"))
+                response.success = False
+                response.message = "no_frames_with_required_gears"
+                return response
+
+            avg_teeth = self._mean_vectors(good_vectors)
+            before = self._calib.baseline().n_samples if self._calib.is_set() and self._calib.baseline() else 0
+            self._calib.append_sample(avg_teeth)
+            b = self._calib.baseline()
+            assert b is not None
+
+            reason = "baseline_updated" if before > 0 else "baseline_created"
+            report = self._mk_report(
+                "calibration",
+                ok=True,
+                reason=reason,
+                required_gears=required_gears,
+                expected_gears=b.expected_gears,
+                averaging={"method": "mean_over_good_frames", "n_good": len(good_vectors), "n_total": len(frames)},
+                calib_avg_teeth=[float(x) for x in avg_teeth],
+                teeth_ref=b.mean_teeth,
+                baseline_stat_tol=b.stat_tol,
+                n_samples_total=b.n_samples,
+                per_frame=per_frame,
+                note="consensus_disabled",
+            )
+            self._publish_report(report)
+            if last_annot is not None:
+                self._publish_image(self._overlay_text(last_annot, "CALIB OK"))
+
+            response.success = True
+            response.message = reason
+            return response
+        finally:
+            self._leave_busy()
+
+    def _srv_inference(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        if not self._try_enter_busy(response, "inference"):
+            return response
+        try:
+            if not self._calib.is_set():
+                report = self._mk_report("inference", ok=False, reason="baseline_not_set")
+                self._publish_report(report)
+                response.success = False
+                response.message = "baseline_not_set"
+                return response
+
+            required_gears = int(self.get_parameter("required_gears").value)
+            b = self._calib.baseline()
+            assert b is not None
+
+            if b.expected_gears != required_gears:
+                report = self._mk_report(
+                    "inference",
+                    ok=False,
+                    reason="baseline_expected_gears_mismatch_required_gears",
+                    expected_gears=b.expected_gears,
+                    required_gears=required_gears,
+                )
+                self._publish_report(report)
+                response.success = False
+                response.message = "baseline_expected_gears_mismatch_required_gears"
+                return response
+
+            infer_samples = int(self.get_parameter("infer_samples").value)
+            frame_timeout = float(self.get_parameter("frame_wait_timeout_sec").value)
+            find_timeout = float(self.get_parameter("infer_find_timeout_sec").value)
+            max_attempts = int(self.get_parameter("infer_max_attempts").value)
+
+            cfg = self._make_cfg()
+
+            per_frame: List[Dict[str, Any]] = []
+            good_vectors: List[List[float]] = []
+            last_annot: Optional[np.ndarray] = None
+            last_debug: Dict[str, Any] = {}
+
+            # start stamp
+            with self._img_cond:
+                last_stamp = self._img_stamp_ns
+
+            # 1) Find first good frame (gears == required_gears)
+            t_start = time.time()
+            found = False
+            attempt = 0
+
+            while attempt < max_attempts and (time.time() - t_start) < find_timeout:
+                attempt += 1
+                img = self._wait_next_frame(last_stamp, timeout_sec=frame_timeout)
+                if img is None:
+                    per_frame.append({"i": attempt, "ok": False, "reason": "frame_timeout", "gears": 0, "teeth": []})
+                    continue
+
+                with self._img_cond:
+                    last_stamp = self._img_stamp_ns
+
+                res = count_teeth(img, cfg=cfg)
+                last_annot = res.annotated_bgr
+                last_debug = res.debug
+
+                if not res.ok:
+                    per_frame.append({"i": attempt, "ok": False, "reason": res.reason, "gears": len(res.teeth), "teeth": []})
+                    continue
+
+                gears = len(res.teeth)
+                if gears != required_gears:
+                    per_frame.append({"i": attempt, "ok": False, "reason": "gears_not_required", "gears": gears, "teeth": []})
+                    continue
+
+                vec = [float(x) for x in res.teeth]
+                good_vectors.append(vec)
+                per_frame.append({"i": attempt, "ok": True, "reason": "ok", "gears": gears, "teeth": vec})
+                found = True
+                break
+
+            if not found:
+                report = self._mk_report(
+                    "inference",
+                    ok=False,
+                    reason="no_frames_with_required_gears",
+                    required_gears=required_gears,
+                    per_frame=per_frame,
+                    debug=last_debug,
+                    note="inference_waited_for_good_frame_but_not_found",
+                )
+                self._publish_report(report)
+                if last_annot is not None:
+                    self._publish_image(self._overlay_text(last_annot, "FAIL"))
+                response.success = False
+                response.message = "no_frames_with_required_gears"
+                return response
+
+            # 2) Collect more frames (infer_samples-1), keep only good ones
+            remaining = max(0, infer_samples - 1)
+            for k in range(remaining):
+                img = self._wait_next_frame(last_stamp, timeout_sec=frame_timeout)
+                if img is None:
+                    per_frame.append({"i": attempt + k + 1, "ok": False, "reason": "frame_timeout", "gears": 0, "teeth": []})
+                    continue
+
+                with self._img_cond:
+                    last_stamp = self._img_stamp_ns
+
+                res = count_teeth(img, cfg=cfg)
+                last_annot = res.annotated_bgr
+                last_debug = res.debug
+
+                if not res.ok:
+                    per_frame.append({"i": attempt + k + 1, "ok": False, "reason": res.reason, "gears": len(res.teeth), "teeth": []})
+                    continue
+
+                gears = len(res.teeth)
+                if gears != required_gears:
+                    per_frame.append({"i": attempt + k + 1, "ok": False, "reason": "gears_not_required", "gears": gears, "teeth": []})
+                    continue
+
+                vec = [float(x) for x in res.teeth]
+                good_vectors.append(vec)
+                per_frame.append({"i": attempt + k + 1, "ok": True, "reason": "ok", "gears": gears, "teeth": vec})
+
+            # good_vectors is guaranteed >= 1
+            avg_teeth = self._mean_vectors(good_vectors)
+
+            # 3) Compare with baseline
+            base_tol = float(self.get_parameter("baseline_abs_tol").value)
+
+            per_gear = []
+            mismatches = []
+            overall_ok = True
+
+            for i in range(b.expected_gears):
+                ref = float(b.mean_teeth[i])
+                cur = float(avg_teeth[i])
+                diff = cur - ref
+                ok_i = abs(diff) <= base_tol
+                overall_ok = overall_ok and ok_i
+                item = {"index": i, "ref": ref, "cur": cur, "diff": diff, "tol": base_tol, "ok": ok_i}
+                per_gear.append(item)
+                if not ok_i:
+                    mismatches.append(item)
+
+            report = self._mk_report(
+                "inference",
+                ok=overall_ok,
+                reason="ok" if overall_ok else "gears_different",
+                required_gears=required_gears,
+                expected_gears=b.expected_gears,
+                teeth_ref=b.mean_teeth,
+                teeth_cur=[float(x) for x in avg_teeth],
+                averaging={"method": "mean_over_good_frames", "n_good": len(good_vectors)},
+                tolerance={"abs_teeth": base_tol},
+                mismatches=mismatches[:50],
+                per_gear=per_gear,
+                per_frame=per_frame,
+                debug=last_debug,
+                note="inference_waits_until_first_good_then_collects_more",
+            )
+
+            self._publish_report(report)
+            if last_annot is not None:
+                self._publish_image(self._overlay_text(last_annot, "OK" if overall_ok else "FAIL"))
+
+            response.success = bool(overall_ok)
+            response.message = str(report["reason"])
+            return response
+        finally:
+            self._leave_busy()
 
 
-def _nearest_center_dist(cx: int, cy: int, centers: List[Tuple[int, int]]) -> float:
-    dmin = float("inf")
-    for (x2, y2) in centers:
-        if x2 == cx and y2 == cy:
-            continue
-        d = math.hypot(float(x2 - cx), float(y2 - cy))
-        dmin = min(dmin, d)
-    return dmin
-
-
-def count_teeth(image_bgr: np.ndarray, cfg: Optional[GearCounterConfig] = None) -> GearCountResult:
-    cfg = cfg or GearCounterConfig()
-    debug: Dict[str, Any] = {}
-
-    if image_bgr is None or not isinstance(image_bgr, np.ndarray) or image_bgr.size == 0:
-        z = np.zeros((1, 1, 3), dtype=np.uint8)
-        return GearCountResult(False, "empty_image", [], [], [], [], z, z, {"reason": "empty_image"})
-
+def main() -> None:
+    rclpy.init()
+    node = GearInspectorNode()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        blurred = blur(
-            image_bgr,
-            d=cfg.bilateral_d,
-            sigma_color=cfg.bilateral_sigma_color,
-            sigma_space=cfg.bilateral_sigma_space,
-        )
-        pre = brighten_region(
-            blurred, cfg.brighten_region, factor=cfg.brighten_factor, blend=cfg.brighten_blend
-        )
-
-        # --- Hough centers with CLAHE ---
-        gray = cv2.cvtColor(pre, cv2.COLOR_BGR2GRAY)
-        if cfg.use_clahe_for_hough:
-            clahe = cv2.createCLAHE(
-                clipLimit=float(cfg.clahe_clip_limit),
-                tileGridSize=(int(cfg.clahe_tile_grid), int(cfg.clahe_tile_grid)),
-            )
-            gray = clahe.apply(gray)
-
-        circles = cv2.HoughCircles(
-            gray,
-            cv2.HOUGH_GRADIENT,
-            dp=float(cfg.hough_dp),
-            minDist=float(cfg.hough_min_dist),
-            param1=float(cfg.hough_param1),
-            param2=float(cfg.hough_param2),
-            minRadius=int(cfg.hough_min_radius),
-            maxRadius=int(cfg.hough_max_radius),
-        )
-        circles = filter_circles_by_max_distance(circles, float(cfg.max_neighbor_dist))
-        circles_sorted = sort_circles(circles, y_tol=int(cfg.sort_y_tol))
-        circles_u16 = np.uint16(np.around(circles_sorted)) if circles_sorted is not None else np.empty((0, 3), dtype=np.uint16)
-
-        centers: List[Tuple[int, int]] = []
-        pre_draw = pre.copy()
-
-        if isinstance(circles_u16, np.ndarray) and circles_u16.size > 0:
-            if circles_u16.ndim == 3 and circles_u16.shape[-1] == 3:
-                circles_u16 = circles_u16[0]
-            for (x, y, r) in circles_u16:
-                x, y, r = int(x), int(y), int(r)
-                centers.append((x, y))
-                cv2.circle(pre_draw, (x, y), r, (0, 255, 0), 2)
-                cv2.circle(pre_draw, (x, y), 2, (0, 0, 255), 2)
-
-        debug["centers"] = centers
-        debug["n_centers"] = len(centers)
-
-        annotated = pre_draw.copy()
-        teeth: List[float] = []
-        r_big_list: List[float] = []
-        r_small_list: List[float] = []
-        r_big_max_local_list: List[int] = []
-        r_small_max_local_list: List[int] = []
-
-        for (x, y) in centers:
-            center = (int(x), int(y))
-
-            # --- FIX: limit r_max by nearest neighbor distance ---
-            dmin = _nearest_center_dist(center[0], center[1], centers)
-            if math.isfinite(dmin):
-                big_r_max_local = min(int(cfg.big_r_max), int(cfg.big_r_max_from_neighbor_frac * dmin))
-                small_r_max_local = min(int(cfg.small_r_max), int(cfg.small_r_max_from_neighbor_frac * dmin))
-            else:
-                big_r_max_local = int(cfg.big_r_max)
-                small_r_max_local = int(cfg.small_r_max)
-
-            big_r_max_local = max(big_r_max_local, int(cfg.big_r_min) + 5)
-            small_r_max_local = max(small_r_max_local, int(cfg.small_r_min) + 2)
-            r_big_max_local_list.append(int(big_r_max_local))
-            r_small_max_local_list.append(int(small_r_max_local))
-
-            r_big, info_big = find_best_circle_radius(
-                pre,
-                center,
-                r_min=int(cfg.big_r_min),
-                r_max=int(big_r_max_local),
-                step=int(cfg.radius_step),
-                thickness=int(cfg.radius_thickness),
-                angles=int(cfg.radius_angles),
-                blur_ksize=int(cfg.blur_ksize),
-                canny1=int(cfg.canny1),
-                canny2=int(cfg.canny2),
-                refine_subpixel=bool(cfg.refine_subpixel),
-                size_penalty=float(cfg.radius_size_penalty),
-            )
-            r_small, info_small = find_best_circle_radius(
-                pre,
-                center,
-                r_min=int(cfg.small_r_min),
-                r_max=int(small_r_max_local),
-                step=int(cfg.radius_step),
-                thickness=int(cfg.radius_thickness),
-                angles=int(cfg.radius_angles),
-                blur_ksize=int(cfg.blur_ksize),
-                canny1=int(cfg.canny1),
-                canny2=int(cfg.canny2),
-                refine_subpixel=bool(cfg.refine_subpixel),
-                size_penalty=float(cfg.radius_size_penalty),
-            )
-
-            r_big_list.append(float(r_big))
-            r_small_list.append(float(r_small))
-
-            cv2.circle(annotated, center, int(round(r_big)), (0, 0, 255), 2)
-            cv2.circle(annotated, center, int(round(r_small)), (255, 0, 0), 2)
-            cv2.circle(annotated, center, 4, (0, 255, 0), -1)
-
-            denom = (cfg.teeth_k2_den / max(1e-9, cfg.teeth_k2_num))
-            t = ((float(r_big) / max(1e-9, float(r_small))) * cfg.teeth_k1 / denom)
-            teeth.append(float(t))
-
-            debug.setdefault("r_big_scores", []).append(float(info_big.get("best_score", 0.0)))
-            debug.setdefault("r_small_scores", []).append(float(info_small.get("best_score", 0.0)))
-
-        debug["r_big_max_local"] = r_big_max_local_list
-        debug["r_small_max_local"] = r_small_max_local_list
-        debug["r_big"] = r_big_list
-        debug["r_small"] = r_small_list
-        debug["teeth"] = teeth
-
-        if not teeth:
-            return GearCountResult(
-                ok=False,
-                reason="no_gears_found",
-                teeth=[],
-                centers=centers,
-                r_big=r_big_list,
-                r_small=r_small_list,
-                preprocessed_bgr=pre_draw,
-                annotated_bgr=annotated,
-                debug=debug,
-            )
-
-        return GearCountResult(
-            ok=True,
-            reason="ok",
-            teeth=teeth,
-            centers=centers,
-            r_big=r_big_list,
-            r_small=r_small_list,
-            preprocessed_bgr=pre_draw,
-            annotated_bgr=annotated,
-            debug=debug,
-        )
-
-    except Exception as e:
-        return GearCountResult(
-            ok=False,
-            reason="internal_error",
-            teeth=[],
-            centers=[],
-            r_big=[],
-            r_small=[],
-            preprocessed_bgr=image_bgr.copy(),
-            annotated_bgr=image_bgr.copy(),
-            debug={"error": repr(e)},
-        )
+        executor.spin()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
-def main_func(image_bgr: np.ndarray):
-    """
-    Notebook-compatible wrapper:
-      returns (preprocessed_with_centers, teeth_list, annotated_with_radii)
-    """
-    res = count_teeth(image_bgr, cfg=None)
-    return res.preprocessed_bgr, res.teeth, res.annotated_bgr
+if __name__ == "__main__":
+    main()
