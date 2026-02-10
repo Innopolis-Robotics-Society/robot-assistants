@@ -11,7 +11,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
 
     ur_cfg = PathJoinSubstitution([FindPackageShare("iros_assistant_bringup"), "config", "UR10e-1.yaml"])
-    rviz_cfg = PathJoinSubstitution([FindPackageShare("iros_assistant_bringup"), "rviz", "inspector.rviz"])
+    rviz_cfg = PathJoinSubstitution([FindPackageShare("iros_assistant_bringup"), "rviz", "test_inspector.rviz"])
 
     video_device_arg = DeclareLaunchArgument(
         "video_device",
@@ -159,12 +159,7 @@ def generate_launch_description():
             video_device_arg,
             tf,
             camera,
-            iros_text_to_speach,
-            ur_launch,
-            robopro_launch,
             cv_pipeline,
-            voice_rec,
-            behavior,
             rviz,
         ]
     )

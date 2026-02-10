@@ -1,6 +1,6 @@
 rc_robot_driver:
   ros__parameters:
-    robot_ip: "192.168.0.15"
+    robot_ip: "10.10.10.10"
     robot_timeout_sec: 5
 
     world_frame: "world"
@@ -15,7 +15,7 @@ rc_robot_driver:
     # TCP offset: static transform flange_link -> tool0
     # (X,Y,Z in meters; R,P,Y in degrees)
     flange_to_tool_xyz: [0.0, 0.0, 0.0]
-    flange_to_tool_rpy_deg: [90.0, 90.0, 135.0]
+    flange_to_tool_rpy_deg: [00.0, 90.0, 135.0]
     tool_offset_units: "deg"
     set_tcp_on_start: true
 
@@ -32,5 +32,5 @@ rc_robot_driver:
 
     # Gripper DO backend: wrist or controller
     gripper_backend: "controller"
-    gripper_pin0: 0
-    gripper_pin1: 1
+    gripper_pin0: 1
+    gripper_pin1: 0

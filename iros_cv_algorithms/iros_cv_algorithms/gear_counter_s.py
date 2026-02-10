@@ -15,7 +15,7 @@ class GearCounterConfig:
     brighten_region: Tuple[int, int, int, int] = (0, 0, 550, 550)  # (x1,y1,x2,y2)
     brighten_factor: float = 1.2
     brighten_blend: bool = True
-    bilateral_d: int = 5
+    bilateral_d: int = 9
     bilateral_sigma_color: float = 75.0
     bilateral_sigma_space: float = 75.0
 
@@ -56,7 +56,7 @@ class GearCounterConfig:
     radius_angles: int = 720
     canny1: int = 40
     canny2: int = 120
-    blur_ksize: int = 0
+    blur_ksize: int = 5
     refine_subpixel: bool = True
 
     # Optional penalty to avoid sticking to large radii (0 = off)
@@ -271,7 +271,7 @@ def find_best_circle_radius(
     step: int = 1,
     thickness: int = 2,
     angles: int = 720,
-    blur_ksize: int = 0,
+    blur_ksize: int = 5,
     canny1: int = 50,
     canny2: int = 150,
     refine_subpixel: bool = True,

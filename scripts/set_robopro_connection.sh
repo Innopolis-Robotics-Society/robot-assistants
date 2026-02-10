@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ====== CONFIG ======
-ROBOT_IP="${ROBOT_IP:-192.168.0.15}"
-HOST_IP_CIDR="${HOST_IP_CIDR:-192.168.0.10/24}"
+ROBOT_IP="${ROBOT_IP:-10.10.10.10}"
+HOST_IP_CIDR="${HOST_IP_CIDR:-10.10.10.1/24}"
 
 # Можно передать интерфейс первым аргументом: ./setup_ur_net.sh enx1234...
 IFACE="${1:-}"

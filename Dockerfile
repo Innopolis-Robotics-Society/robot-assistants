@@ -156,7 +156,7 @@ RUN set -eux; \
     rm -f /tmp/libk4a1.4*.deb; \
     rm -rf /var/lib/apt/lists/*
 
-# Clean up
+# Clean upros2 topic pub --once /voice/command std_msgs/msg/String 'data: "Maf"'
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Initialize rosdep (run as user)
@@ -182,3 +182,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip \
 
 CMD ["bash"]
 #docker build -t image_name -f Dockerfile .
+
+
+python3 -m pip install --user torch torchvision
+python3 -m pip install --user segmentation-models-pytorch
