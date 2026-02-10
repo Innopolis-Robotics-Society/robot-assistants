@@ -8,14 +8,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import rclpy
-from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
-from std_srvs.srv import Trigger
-from std_msgs.msg import Bool, String
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
 
 
 # ---------------- small utils ----------------
@@ -68,48 +68,29 @@ def _pick_float_from_dict(d: dict, keys: Tuple[str, ...], default: Optional[floa
     return default
 
 
-def _pick_int_from_dict(d: dict, keys: Tuple[str, ...], default: Optional[int] = None) -> Optional[int]:
-    for k in keys:
-        if k in d:
-            v = d[k]
-            if isinstance(v, bool):
-                return int(v)
-            if isinstance(v, int):
-                return int(v)
-            if isinstance(v, float):
-                return int(v)
-            if isinstance(v, str):
-                try:
-                    return int(float(v.strip()))
-                except Exception:
-                    pass
-    return default
-
-
 # ---------------- node ----------------
 
 class CvSessionHubNode(Node):
     """
     Hub node with 3 independent "run" triggers + 1 "publish" trigger (one-shot).
 
-    Updated rust parsing for NEW rust node JSON:
-      - rust classification (ResNet decision): d["run_unet"] (bool)
-      - final detection (UNet+post): d["detected"] (bool)
-      - rust probability: d["rust_prob"] (float)
-    Select which one should be treated as "rust_detected" via param rust_detect_mode:
-      - "resnet" -> use run_unet as rust_detected (your desired behavior)
-      - "final"  -> use detected as rust_detected
-    Default is "resnet".
+    Services:
+      - ~/run_rust : call rust Trigger service + listen for listen_duration_s, snapshot rust topics
+      - ~/run_pcb  : call pcb Trigger service + listen, snapshot pcb topics
+      - ~/run_gear : call gear Trigger service + listen, snapshot gear topics
+      - ~/publish  : publish stored snapshots ONCE, and publish /<prefix>/ok for a short burst
 
-    Additional:
-    - On ~/publish, publishes /<output_prefix>/ok as Bool for a short burst (few seconds),
-      so downstream nodes can catch it.
-        ok = (rust_detected == False) AND (pcb_ok == True) AND (gear_ok == True)
+    Root OK rule (published on /<prefix>/ok and included in /<prefix>/report):
+      ok = (rust_detected == False) AND (pcb_ok == True) AND (gear_ok == True)
+
+    Rust parsing supports "new" rust JSON:
+      - d["run_unet"]   (bool) : ResNet decision (whether to run UNet)  -> used when rust_detect_mode="resnet"
+      - d["detected"]   (bool) : final detection (UNet+post)            -> used when rust_detect_mode="final"
+      - d["rust_prob"]  (float): rust probability
     """
 
     def __init__(self) -> None:
         super().__init__("iros_cv_session_hub")
-
         self._cbg = ReentrantCallbackGroup()
 
         # -------- params --------
@@ -117,27 +98,27 @@ class CvSessionHubNode(Node):
         self.declare_parameter("output_prefix", "/cv_hub")
 
         # ok burst publishing
-        self.declare_parameter("ok_burst_duration_s", 2.0)  # publish /ok for this many seconds
-        self.declare_parameter("ok_burst_rate_hz", 10.0)    # publish frequency during burst
+        self.declare_parameter("ok_burst_duration_s", 2.0)
+        self.declare_parameter("ok_burst_rate_hz", 10.0)
 
-        # rust inputs
-        self.declare_parameter("rust_service", "/rust_detect/run")          # std_srvs/Trigger
-        self.declare_parameter("rust_service_timeout_s", 2.0)
-        self.declare_parameter("rust_prob_topic", "/rust/prob")             # sensor_msgs/Image
-        self.declare_parameter("rust_detected_topic", "/rust/detected")     # std_msgs/Bool (optional)
-        self.declare_parameter("rust_detect_mode", "resnet")                # "resnet"|"final"
+        # rust
+        self.declare_parameter("rust_service", "/rust_detect/run")
+        self.declare_parameter("rust_service_timeout_s", 10.0)
+        self.declare_parameter("rust_prob_topic", "/rust/prob")
+        self.declare_parameter("rust_detected_topic", "/rust/detected")
+        self.declare_parameter("rust_detect_mode", "resnet")  # "resnet"|"final"
 
-        # pcb inputs
-        self.declare_parameter("pcb_infer_service", "/pcb_inspector/inference")   # std_srvs/Trigger
-        self.declare_parameter("pcb_service_timeout_s", 3.0)
-        self.declare_parameter("pcb_report_topic", "/pcb_inspector/report")       # std_msgs/String(JSON)
-        self.declare_parameter("pcb_annotated_topic", "/pcb_inspector/annotated") # sensor_msgs/Image
+        # pcb
+        self.declare_parameter("pcb_infer_service", "/pcb_inspector/inference")
+        self.declare_parameter("pcb_service_timeout_s", 10.0)
+        self.declare_parameter("pcb_report_topic", "/pcb_inspector/report")
+        self.declare_parameter("pcb_annotated_topic", "/pcb_inspector/annotated")
 
-        # gear inputs
-        self.declare_parameter("gear_infer_service", "/gear_inspector/inference")   # std_srvs/Trigger
-        self.declare_parameter("gear_service_timeout_s", 3.0)
-        self.declare_parameter("gear_report_topic", "/gear_inspector/report")       # std_msgs/String(JSON)
-        self.declare_parameter("gear_annotated_topic", "/gear_inspector/annotated") # sensor_msgs/Image
+        # gear
+        self.declare_parameter("gear_infer_service", "/gear_inspector/inference")
+        self.declare_parameter("gear_service_timeout_s", 10.0)
+        self.declare_parameter("gear_report_topic", "/gear_inspector/report")
+        self.declare_parameter("gear_annotated_topic", "/gear_inspector/annotated")
 
         # -------- locks/state --------
         self._live_lock = threading.Lock()
@@ -165,7 +146,7 @@ class CvSessionHubNode(Node):
 
         # snapshots: rust
         self._snap_rust_prob: Optional[Image] = None
-        self._snap_rust_detected: Optional[bool] = None  # per rust_detect_mode
+        self._snap_rust_detected: Optional[bool] = None
         self._snap_rust_service: Optional[dict] = None
         self._snap_rust_report_str: str = ""
         self._snap_rust_meta: Dict[str, Any] = {}
@@ -192,7 +173,7 @@ class CvSessionHubNode(Node):
         # -------- I/O --------
         out_prefix = str(self.get_parameter("output_prefix").value).rstrip("/") or "/cv_hub"
 
-        # Publishers (one-shot publish via ~/publish)
+        # Outputs (published only on ~/publish)
         self._pub_rust_prob = self.create_publisher(Image, f"{out_prefix}/rust/prob", qos_profile_sensor_data)
         self._pub_rust_det = self.create_publisher(Bool, f"{out_prefix}/rust/detected", 10)
         self._pub_rust_rep = self.create_publisher(String, f"{out_prefix}/rust/report", 10)
@@ -208,30 +189,30 @@ class CvSessionHubNode(Node):
         self._pub_report = self.create_publisher(String, f"{out_prefix}/report", 10)
         self._pub_ok = self.create_publisher(Bool, f"{out_prefix}/ok", 10)
 
-        # Subscribers
+        # Subscribers (inputs)
         self.create_subscription(
-            Image, str(self.get_parameter("rust_prob_topic").value), self._on_rust_prob,
-            qos_profile_sensor_data, callback_group=self._cbg
+            Image, str(self.get_parameter("rust_prob_topic").value),
+            self._on_rust_prob, qos_profile_sensor_data, callback_group=self._cbg
         )
         self.create_subscription(
-            Bool, str(self.get_parameter("rust_detected_topic").value), self._on_rust_detected,
-            10, callback_group=self._cbg
+            Bool, str(self.get_parameter("rust_detected_topic").value),
+            self._on_rust_detected, 10, callback_group=self._cbg
         )
         self.create_subscription(
-            Image, str(self.get_parameter("pcb_annotated_topic").value), self._on_pcb_annot,
-            qos_profile_sensor_data, callback_group=self._cbg
+            Image, str(self.get_parameter("pcb_annotated_topic").value),
+            self._on_pcb_annot, qos_profile_sensor_data, callback_group=self._cbg
         )
         self.create_subscription(
-            String, str(self.get_parameter("pcb_report_topic").value), self._on_pcb_report,
-            10, callback_group=self._cbg
+            String, str(self.get_parameter("pcb_report_topic").value),
+            self._on_pcb_report, 10, callback_group=self._cbg
         )
         self.create_subscription(
-            Image, str(self.get_parameter("gear_annotated_topic").value), self._on_gear_annot,
-            qos_profile_sensor_data, callback_group=self._cbg
+            Image, str(self.get_parameter("gear_annotated_topic").value),
+            self._on_gear_annot, qos_profile_sensor_data, callback_group=self._cbg
         )
         self.create_subscription(
-            String, str(self.get_parameter("gear_report_topic").value), self._on_gear_report,
-            10, callback_group=self._cbg
+            String, str(self.get_parameter("gear_report_topic").value),
+            self._on_gear_report, 10, callback_group=self._cbg
         )
 
         # Service clients
@@ -246,10 +227,10 @@ class CvSessionHubNode(Node):
         self.create_service(Trigger, "~/publish", self._on_publish, callback_group=self._cbg)
 
         self.get_logger().info(
-            f"{self.get_name()} ready. Services: ~/(run_rust, run_pcb, run_gear, publish). Outputs prefix: {out_prefix}"
+            f"{self.get_name()} ready. Services: ~/(run_rust, run_pcb, run_gear, publish). Output prefix: {out_prefix}"
         )
 
-    # -------- input callbacks --------
+    # ---------------- input callbacks ----------------
 
     def _on_rust_prob(self, msg: Image) -> None:
         with self._live_lock:
@@ -275,7 +256,7 @@ class CvSessionHubNode(Node):
         with self._live_lock:
             self._live_gear_report = TimedMsg(msg=msg, t_mono=_now_mono())
 
-    # -------- helpers --------
+    # ---------------- helpers ----------------
 
     def _call_trigger(self, client: rclpy.client.Client, timeout_s: float) -> Tuple[bool, Optional[Trigger.Response], str]:
         if not client.service_is_ready():
@@ -346,10 +327,13 @@ class CvSessionHubNode(Node):
     def _start_ok_burst(self, value: bool) -> None:
         duration_s = float(self.get_parameter("ok_burst_duration_s").value) or 0.0
         rate_hz = float(self.get_parameter("ok_burst_rate_hz").value) or 0.0
+
+        # Always publish at least once
+        m0 = Bool()
+        m0.data = bool(value)
+        self._pub_ok.publish(m0)
+
         if duration_s <= 0.0 or rate_hz <= 0.0:
-            m = Bool()
-            m.data = bool(value)
-            self._pub_ok.publish(m)
             return
 
         period_s = 1.0 / max(1e-6, rate_hz)
@@ -361,10 +345,6 @@ class CvSessionHubNode(Node):
 
             self._ok_burst_value = bool(value)
             self._ok_burst_end_mono = _now_mono() + duration_s
-
-            m = Bool()
-            m.data = self._ok_burst_value
-            self._pub_ok.publish(m)
 
             def _tick():
                 with self._ok_burst_lock:
@@ -410,7 +390,7 @@ class CvSessionHubNode(Node):
         }
         return json.dumps(out, ensure_ascii=False)
 
-    # -------- services: run_* --------
+    # ---------------- services: run_* ----------------
 
     def _on_run_rust(self, _req: Trigger.Request, res: Trigger.Response) -> Trigger.Response:
         if not self._run_lock_rust.acquire(blocking=False):
@@ -420,7 +400,7 @@ class CvSessionHubNode(Node):
 
         try:
             listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
-            timeout_s = float(self.get_parameter("rust_service_timeout_s").value) or 2.0
+            timeout_s = float(self.get_parameter("rust_service_timeout_s").value) or 10.0
             detect_mode = str(self.get_parameter("rust_detect_mode").value).strip().lower() or "resnet"
 
             window_start = _now_mono()
@@ -437,11 +417,11 @@ class CvSessionHubNode(Node):
             rust_service_dict: Optional[dict] = None
             resp_success: Optional[bool] = None
 
-            rust_final: Optional[bool] = None      # UNet+post: d["detected"]
-            rust_resnet: Optional[bool] = None     # ResNet decision: d["run_unet"]
-            rust_prob_val: Optional[float] = None  # d["rust_prob"]
+            rust_final: Optional[bool] = None
+            rust_resnet: Optional[bool] = None
+            rust_prob_val: Optional[float] = None
 
-            rust_detected: Optional[bool] = None   # selected per mode
+            rust_detected: Optional[bool] = None
 
             if call_resp is not None:
                 resp_success = bool(getattr(call_resp, "success", False))
@@ -450,15 +430,13 @@ class CvSessionHubNode(Node):
 
                 if isinstance(d, dict):
                     rust_service_dict = d
-
-                    rust_final = _pick_bool_from_dict(d, ("detected", "rust_detected", "final_detected"), default=None)
-                    rust_resnet = _pick_bool_from_dict(d, ("run_unet", "resnet_detected", "rust_pred"), default=None)
+                    rust_final = _pick_bool_from_dict(d, ("detected", "final_detected"), default=None)
+                    rust_resnet = _pick_bool_from_dict(d, ("run_unet", "resnet_detected"), default=None)
                     rust_prob_val = _pick_float_from_dict(d, ("rust_prob", "prob", "score"), default=None)
 
                     if detect_mode == "final":
                         rust_detected = rust_final if rust_final is not None else rust_resnet
                     else:
-                        # default: resnet
                         rust_detected = rust_resnet if rust_resnet is not None else rust_final
 
                     if rust_detected is None:
@@ -466,22 +444,14 @@ class CvSessionHubNode(Node):
                 else:
                     rust_service_dict = {"raw_message": msg}
                     rust_detected = resp_success
-            else:
-                rust_service_dict = None
-                rust_detected = None
 
-            # fallback to topic if still unknown
             if rust_detected is None:
                 rust_detected = rust_det_from_topic
 
-            # detected source
             detected_source = None
             if rust_detected is not None:
                 if call_resp is not None and isinstance(rust_service_dict, dict) and rust_service_dict is not None:
-                    if "detected" in rust_service_dict or "run_unet" in rust_service_dict:
-                        detected_source = f"service_json:{detect_mode}"
-                    else:
-                        detected_source = "service_unknown_json"
+                    detected_source = f"service_json:{detect_mode}"
                 elif call_resp is not None:
                     detected_source = "service_success_fallback"
                 elif got_det_topic:
@@ -538,7 +508,7 @@ class CvSessionHubNode(Node):
 
         try:
             listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
-            timeout_s = float(self.get_parameter("pcb_service_timeout_s").value) or 3.0
+            timeout_s = float(self.get_parameter("pcb_service_timeout_s").value) or 10.0
 
             window_start = _now_mono()
             call_ok, call_resp, call_err = self._call_trigger(self._pcb_cli, timeout_s)
@@ -552,16 +522,28 @@ class CvSessionHubNode(Node):
             pcb_report_msg = live["pcb_report"].msg if got_report and live["pcb_report"] else None
 
             pcb_report_dict = None
-            pcb_ok = None
+            pcb_ok_from_topic = None
             if pcb_report_msg is not None:
                 pcb_report_dict = _safe_json_loads(str(pcb_report_msg.data))
                 if isinstance(pcb_report_dict, dict):
-                    pcb_ok = _pick_bool_from_dict(pcb_report_dict, ("overall_ok", "ok", "success"), default=None)
+                    pcb_ok_from_topic = _pick_bool_from_dict(pcb_report_dict, ("overall_ok", "ok", "success"), default=None)
 
             resp_success = bool(getattr(call_resp, "success", False)) if call_resp is not None else None
-            svc_msg_dict = _safe_json_loads(str(getattr(call_resp, "message", ""))) if call_resp is not None else None
-            if call_resp is not None and not isinstance(svc_msg_dict, dict):
-                svc_msg_dict = {"raw_message": str(getattr(call_resp, "message", ""))}
+            svc_msg = str(getattr(call_resp, "message", "")) if call_resp is not None else ""
+            svc_dict = _safe_json_loads(svc_msg)
+            if call_resp is not None and not isinstance(svc_dict, dict):
+                svc_dict = {"raw_message": svc_msg}
+
+            pcb_ok_from_service = _pick_bool_from_dict(svc_dict, ("overall_ok", "ok", "success"), default=None) if isinstance(svc_dict, dict) else None
+
+            pcb_ok = pcb_ok_from_topic
+            ok_source = "topic" if pcb_ok_from_topic is not None else None
+            if pcb_ok is None and pcb_ok_from_service is not None:
+                pcb_ok = pcb_ok_from_service
+                ok_source = "service_json"
+            if pcb_ok is None and resp_success is not None:
+                pcb_ok = resp_success
+                ok_source = "service_success"
 
             topic_meta = {"got_pcb_annotated": bool(got_annot), "got_pcb_report": bool(got_report)}
             meta = {
@@ -575,9 +557,9 @@ class CvSessionHubNode(Node):
             pcb_report_str = self._compose_check_report(
                 "pcb",
                 call_ok, call_err, resp_success,
-                svc_msg_dict,
+                svc_dict if isinstance(svc_dict, dict) else None,
                 topic_meta,
-                {"ok": pcb_ok},
+                {"ok": pcb_ok, "ok_source": ok_source},
             )
 
             with self._snap_lock:
@@ -605,7 +587,7 @@ class CvSessionHubNode(Node):
 
         try:
             listen_s = float(self.get_parameter("listen_duration_s").value) or 2.0
-            timeout_s = float(self.get_parameter("gear_service_timeout_s").value) or 3.0
+            timeout_s = float(self.get_parameter("gear_service_timeout_s").value) or 10.0
 
             window_start = _now_mono()
             call_ok, call_resp, call_err = self._call_trigger(self._gear_cli, timeout_s)
@@ -618,17 +600,33 @@ class CvSessionHubNode(Node):
             gear_annot_msg = live["gear_annot"].msg if got_annot and live["gear_annot"] else None
             gear_report_msg = live["gear_report"].msg if got_report and live["gear_report"] else None
 
+            # ---- service response ----
+            resp_success = bool(getattr(call_resp, "success", False)) if call_resp is not None else None
+            svc_msg = str(getattr(call_resp, "message", "")) if call_resp is not None else ""
+            svc_dict = _safe_json_loads(svc_msg)
+            if call_resp is not None and not isinstance(svc_dict, dict):
+                svc_dict = {"raw_message": svc_msg}
+
+            # ---- topic report (preferred) ----
             gear_report_dict = None
-            gear_ok = None
+            gear_ok_from_topic = None
             if gear_report_msg is not None:
                 gear_report_dict = _safe_json_loads(str(gear_report_msg.data))
                 if isinstance(gear_report_dict, dict):
-                    gear_ok = _pick_bool_from_dict(gear_report_dict, ("overall_ok", "ok", "success"), default=None)
+                    gear_ok_from_topic = _pick_bool_from_dict(gear_report_dict, ("overall_ok", "ok", "success"), default=None)
 
-            resp_success = bool(getattr(call_resp, "success", False)) if call_resp is not None else None
-            svc_msg_dict = _safe_json_loads(str(getattr(call_resp, "message", ""))) if call_resp is not None else None
-            if call_resp is not None and not isinstance(svc_msg_dict, dict):
-                svc_msg_dict = {"raw_message": str(getattr(call_resp, "message", ""))}
+            # ---- service JSON (optional) ----
+            gear_ok_from_service = _pick_bool_from_dict(svc_dict, ("overall_ok", "ok", "success"), default=None) if isinstance(svc_dict, dict) else None
+
+            # ---- final selection (THIS FIXES "no gear result") ----
+            gear_ok = gear_ok_from_topic
+            ok_source = "topic" if gear_ok_from_topic is not None else None
+            if gear_ok is None and gear_ok_from_service is not None:
+                gear_ok = gear_ok_from_service
+                ok_source = "service_json"
+            if gear_ok is None and resp_success is not None:
+                gear_ok = resp_success
+                ok_source = "service_success"
 
             topic_meta = {"got_gear_annotated": bool(got_annot), "got_gear_report": bool(got_report)}
             meta = {
@@ -642,9 +640,9 @@ class CvSessionHubNode(Node):
             gear_report_str = self._compose_check_report(
                 "gear",
                 call_ok, call_err, resp_success,
-                svc_msg_dict,
+                svc_dict if isinstance(svc_dict, dict) else None,
                 topic_meta,
-                {"ok": gear_ok},
+                {"ok": gear_ok, "ok_source": ok_source},
             )
 
             with self._snap_lock:
@@ -664,7 +662,7 @@ class CvSessionHubNode(Node):
         finally:
             self._run_lock_gear.release()
 
-    # -------- publish (one-shot) --------
+    # ---------------- publish ----------------
 
     def _publish_snapshot_once(self) -> Tuple[str, bool]:
         with self._snap_lock:
@@ -684,6 +682,7 @@ class CvSessionHubNode(Node):
             combined = self._compose_combined_report_locked()
             self._snap_combined_report_str = combined
 
+        # publish rust snapshot
         if rust_prob is not None:
             self._pub_rust_prob.publish(rust_prob)
         if rust_det is not None:
@@ -695,6 +694,7 @@ class CvSessionHubNode(Node):
             s.data = rust_rep
             self._pub_rust_rep.publish(s)
 
+        # publish pcb snapshot
         if pcb_annot is not None:
             self._pub_pcb_annot.publish(pcb_annot)
         if pcb_ok is not None:
@@ -706,6 +706,7 @@ class CvSessionHubNode(Node):
             s.data = pcb_rep
             self._pub_pcb_rep.publish(s)
 
+        # publish gear snapshot
         if gear_annot is not None:
             self._pub_gear_annot.publish(gear_annot)
         if gear_ok is not None:
@@ -717,8 +718,10 @@ class CvSessionHubNode(Node):
             s.data = gear_rep
             self._pub_gear_rep.publish(s)
 
+        # publish global ok burst
         self._start_ok_burst(global_ok)
 
+        # publish combined report once
         s = String()
         s.data = combined
         self._pub_report.publish(s)

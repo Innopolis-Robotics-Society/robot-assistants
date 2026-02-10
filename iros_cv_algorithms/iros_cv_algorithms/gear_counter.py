@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import itertools
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,10 +13,10 @@ import numpy as np
 @dataclass
 class GearCounterConfig:
     # Preprocess
-    brighten_region: Tuple[int, int, int, int] = (0, 0, 550, 550)  # (x1,y1,x2,y2)
+    brighten_region: Tuple[int, int, int, int] =  None# (x1,y1,x2,y2)
     brighten_factor: float = 1.2
     brighten_blend: bool = True
-    bilateral_d: int = 5
+    bilateral_d: int = 3
     bilateral_sigma_color: float = 75.0
     bilateral_sigma_space: float = 75.0
 
@@ -23,7 +24,7 @@ class GearCounterConfig:
     hough_dp: float = 1.5
     hough_min_dist: float = 100.0
     hough_param1: float = 60.0
-    hough_param2: float = 60.0
+    hough_param2: float = 50.0
     hough_min_radius: int = 5
     hough_max_radius: int = 25
 
@@ -41,6 +42,11 @@ class GearCounterConfig:
     # Sorting
     sort_y_tol: int = 25
 
+    # Stable ordering across frames (uses first good detection as reference)
+    stable_order: bool = True
+    stable_order_max_dist: float = 80.0
+    stable_order_reset: bool = False
+
     # Radius search for big/small circle (edge-based)
     big_r_min: int = 35
     big_r_max: int = 300
@@ -56,7 +62,7 @@ class GearCounterConfig:
     radius_angles: int = 720
     canny1: int = 40
     canny2: int = 120
-    blur_ksize: int = 0
+    blur_ksize: int = 5
     refine_subpixel: bool = True
 
     # Optional penalty to avoid sticking to large radii (0 = off)
@@ -81,7 +87,7 @@ class GearCountResult:
     debug: Dict[str, Any]
 
 
-def brighten_region(image: np.ndarray, region, factor: float = 1.5, blend: bool = True) -> np.ndarray:
+def brighten_region(image: np.ndarray, region, factor: float, blend: bool = True) -> np.ndarray:
     if isinstance(region, tuple) and len(region) == 4:
         x1, y1, x2, y2 = region
         x1, y1 = max(0, int(x1)), max(0, int(y1))
@@ -108,7 +114,7 @@ def brighten_region(image: np.ndarray, region, factor: float = 1.5, blend: bool 
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
-def blur(img: np.ndarray, d: int = 9, sigma_color: float = 75, sigma_space: float = 75) -> np.ndarray:
+def blur(img: np.ndarray, d: int = 7, sigma_color: float = 75, sigma_space: float = 75) -> np.ndarray:
     return cv2.bilateralFilter(img, int(d), float(sigma_color), float(sigma_space))
 
 
@@ -165,6 +171,99 @@ def sort_circles(circles, y_tol: int = 25) -> np.ndarray:
     return np.stack([x[order], y[order], r[order]], axis=1).astype(np.float32)
 
 
+# --- Stable ordering across frames (module-level cache) ---
+_REF_CENTER_ORDER: Optional[List[Tuple[int, int]]] = None
+
+
+def _reorder_circles_by_reference(
+    circles_xy_r: np.ndarray,
+    ref_centers: List[Tuple[int, int]],
+    *,
+    max_dist_px: float,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Reorder circles (N,3) to best match ref_centers (N,2) by minimal total distance.
+
+    Uses brute-force permutations; for N=4 it is only 24 permutations.
+    Returns (reordered_circles, debug_dict). If no assignment within max_dist_px,
+    returns input circles unchanged with debug reason.
+    """
+    c = np.asarray(circles_xy_r, dtype=np.float32)
+    if c.ndim != 2 or c.shape[1] != 3 or len(ref_centers) != int(c.shape[0]):
+        return c, {"ok": False, "reason": "bad_shape_or_len", "shape": list(c.shape), "n_ref": len(ref_centers)}
+
+    ref = np.asarray(ref_centers, dtype=np.float32)
+    cur = c[:, :2]
+
+    best_perm = None
+    best_cost = float("inf")
+    best_d = None
+
+    idxs = list(range(int(c.shape[0])))
+    for perm in itertools.permutations(idxs):
+        perm = list(perm)
+        d = np.linalg.norm(cur[perm] - ref, axis=1)
+        if float(np.max(d)) > float(max_dist_px):
+            continue
+        cost = float(np.sum(d))
+        if cost < best_cost:
+            best_cost = cost
+            best_perm = perm
+            best_d = d
+
+    if best_perm is None:
+        return c, {"ok": False, "reason": "no_assignment_within_max_dist", "max_dist_px": float(max_dist_px)}
+
+    return c[best_perm], {
+        "ok": True,
+        "reason": "ok",
+        "perm": best_perm,
+        "dists": best_d.tolist() if best_d is not None else None,
+        "cost": float(best_cost),
+        "max_dist_px": float(max_dist_px),
+    }
+
+
+def _stable_order_circles(
+    circles_xy_r: np.ndarray,
+    cfg: GearCounterConfig,
+    debug: Dict[str, Any],
+) -> np.ndarray:
+    """Apply stable ordering to circles using module-level reference."""
+    global _REF_CENTER_ORDER
+
+    if not bool(cfg.stable_order):
+        return circles_xy_r
+
+    if bool(cfg.stable_order_reset):
+        _REF_CENTER_ORDER = None
+        debug["stable_order"] = {"ok": True, "reason": "reset"}
+
+    c = np.asarray(circles_xy_r)
+    n = int(c.shape[0]) if c.ndim == 2 else 0
+    if n == 0:
+        return circles_xy_r
+
+    centers = [(int(round(x)), int(round(y))) for x, y in c[:, :2]]
+
+    # Initialize reference on first non-empty detection
+    if _REF_CENTER_ORDER is None:
+        _REF_CENTER_ORDER = centers
+        debug["stable_order"] = {"ok": True, "reason": "reference_set", "ref_centers": _REF_CENTER_ORDER}
+        return circles_xy_r
+
+    # Only reorder when lengths match
+    if len(_REF_CENTER_ORDER) != n:
+        debug["stable_order"] = {
+            "ok": False,
+            "reason": "ref_len_mismatch",
+            "n_ref": len(_REF_CENTER_ORDER),
+            "n_cur": n,
+        }
+        return circles_xy_r
+
+    reordered, dbg = _reorder_circles_by_reference(c, _REF_CENTER_ORDER, max_dist_px=float(cfg.stable_order_max_dist))
+    debug["stable_order"] = dbg
+    return reordered
 
 
 def validate_circles_geometry(
@@ -271,7 +370,7 @@ def find_best_circle_radius(
     step: int = 1,
     thickness: int = 2,
     angles: int = 720,
-    blur_ksize: int = 0,
+    blur_ksize: int = 5,
     canny1: int = 50,
     canny2: int = 150,
     refine_subpixel: bool = True,
@@ -399,6 +498,13 @@ def count_teeth(image_bgr: np.ndarray, cfg: Optional[GearCounterConfig] = None) 
         circles = filter_circles_by_max_distance(circles, float(cfg.max_neighbor_dist))
         circles_sorted = sort_circles(circles, y_tol=int(cfg.sort_y_tol))
         circles_u16 = np.uint16(np.around(circles_sorted)) if circles_sorted is not None else np.empty((0, 3), dtype=np.uint16)
+
+        # Keep circle order stable across frames (optional)
+        if isinstance(circles_u16, np.ndarray) and circles_u16.size > 0:
+            if circles_u16.ndim == 3 and circles_u16.shape[-1] == 3:
+                circles_u16 = circles_u16[0]
+            circles_u16 = _stable_order_circles(circles_u16.astype(np.float32), cfg, debug)
+            circles_u16 = np.uint16(np.around(circles_u16))
 
         pre_draw = pre.copy()
 

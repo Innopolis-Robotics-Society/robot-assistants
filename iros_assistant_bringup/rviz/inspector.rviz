@@ -6,7 +6,7 @@ Panels:
       Expanded:
         - /Global Options1
         - /Image3
-        - /TF1
+        - /Image4
       Splitter Ratio: 0.5
     Tree Height: 1057
   - Class: rviz_common/Selection
@@ -88,7 +88,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /gears_check/annotated
+        Value: /gears_check/image
       Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true

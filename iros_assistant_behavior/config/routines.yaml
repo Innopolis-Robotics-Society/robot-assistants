@@ -4,8 +4,11 @@ routines:
       - type: service
         service_name: /go_to_frame
         service_type: iros_custom_msgs/srv/GoToFrame
-        request: { frame: pose_up }
+        request: { frame: poi_gear_common }
         delay_after_sec: 0.5
+
+      - type: sleep
+        duration_sec: 1.5
 
       - type: service
         service_name: /iros_cv_session_hub/run_rust
@@ -20,6 +23,9 @@ routines:
         request: { frame: poi_pcb }
         delay_after_sec: 0.5
 
+      - type: sleep
+        duration_sec: 1.5
+
       - type: service
         service_name: /iros_cv_session_hub/run_pcb
         service_type: std_srvs/srv/Trigger
@@ -32,6 +38,9 @@ routines:
         service_type: iros_custom_msgs/srv/GoToFrame
         request: { frame: poi_gear_common }
         delay_after_sec: 0.5
+
+      - type: sleep
+        duration_sec: 1.5
 
       - type: service
         service_name: /iros_cv_session_hub/run_gear
@@ -147,11 +156,11 @@ routines:
         service_type: iros_custom_msgs/srv/GoToFrame
         request: { frame: poi_gear_common }
 
-      # - type: service
-      #   service_name: /gears_check/calibration
-      #   service_type: std_srvs/srv/Trigger
-      #   request: {}
-      #   service_timeout_sec: 20.0
+      - type: service
+        service_name: /gears_check/calibration
+        service_type: std_srvs/srv/Trigger
+        request: {}
+        service_timeout_sec: 20.0
 
   reset:
     steps:
@@ -161,8 +170,8 @@ routines:
         request: {}
         service_timeout_sec: 20.0
 
-      # - type: service
-      #   service_name: /gears_check/reset
-      #   service_type: std_srvs/srv/Trigger
-      #   request: {}
-      #   service_timeout_sec: 20.0
+      - type: service
+        service_name: /gears_check/reset
+        service_type: std_srvs/srv/Trigger
+        request: {}
+        service_timeout_sec: 20.0
