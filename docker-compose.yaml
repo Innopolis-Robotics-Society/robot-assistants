@@ -19,10 +19,13 @@ x-common: &common-setup
 services:
   terminal:
     <<: *common-setup
-    image: fabook/cv:v0.0.2
+    image: fabook/cv:v0.0.5
     stdin_open: true
     tty: true
+    gpus: all
+    runtime: nvidia
     devices:
+      - /dev/bus/usb:/dev/bus/usb
       - /dev/video0:/dev/video0
       - /dev/video1:/dev/video1
       - /dev/snd:/dev/snd
@@ -36,3 +39,25 @@ services:
       sudo chmod 666 /dev/ttyACM* 2>/dev/null || true;
       exec bash"
       ]
+
+  rest_api:
+    <<: *common-setup
+    build: .
+    image: robot-assistants-rest-api:dev
+    profiles: ["api"]
+    stdin_open: true
+    tty: true
+    gpus: all
+    runtime: nvidia
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      - /dev/snd:/dev/snd
+    group_add:
+      - "video"
+      - "44"
+    command: [
+      "/bin/bash","-lc",
+      "source /opt/ros/humble/setup.bash && python3 -m pip install -r src/iros_rest_api/requirements.txt && colcon build --symlink-install --packages-select iros_custom_msgs iros_rest_api && source install/setup.bash && ros2 run iros_rest_api api_server --host 0.0.0.0 --port 8000"
+    ]

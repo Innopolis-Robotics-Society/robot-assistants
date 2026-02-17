@@ -40,7 +40,7 @@ The main entrypoint launches a complete stack for the default demo scenario (pic
   - `launch/detect_apriltags.launch.py` — namespaced pipeline per camera
   - `config/apriltag.yaml` — tag ids/frames/sizes and detector settings
 
-- **`iros_cv`**  
+- **`iros_tool_recognition`**  
   YOLO-based object localization node(s):
   - `ins_search.py` — detects an object, publishes debug image + target TF/Point
   - model stored in `models/`
@@ -162,6 +162,8 @@ ros2 launch iros_camera camera.launch.py cameras:=mook_laptop_camera
 
 ### AprilTags (for a specific camera namespace)
 
+/home/mobile/ros2_ws/src/iros_cv_algorithms/iros_cv_algorithms/algos/models/yolo11s_best.pt
+
 ```bash
 ros2 launch iros_april_tags detect_apriltags.launch.py camera:=mook_laptop_camera
 ```
@@ -176,9 +178,9 @@ If your CV launch expects rectified images:
 
 ## Services (iros_assistant_bringup)
 
-Service definitions live in: `iros_assistant_bringup/srv/`
+Service definitions live in: `iros_custom_msgs/srv/`
 
-### `DetectObject` (`iros_assistant_bringup/srv/DetectObject.srv`)
+### `DetectObject` (`iros_custom_msgs/srv/DetectObject.srv`)
 
 Request:
 ```text
@@ -205,12 +207,12 @@ Typical usage:
 Example call:
 
 ```bash
-ros2 service call /detect_object iros_assistant_bringup/srv/DetectObject "{class_name: 'hammer', duration: 5.0}"
+ros2 service call /detect_object iros_custom_msgs/srv/DetectObject "{class_name: 'hammer', duration: 5.0}"
 ```
 
 ---
 
-### `GoToFrame` (`iros_assistant_bringup/srv/GoToFrame.srv`)
+### `GoToFrame` (`iros_custom_msgs/srv/GoToFrame.srv`)
 
 Request:
 
@@ -232,12 +234,12 @@ Typical usage:
 Example call:
 
 ```bash
-ros2 service call /go_to_frame iros_assistant_bringup/srv/GoToFrame "{frame: 'pose_forward'}"
+ros2 service call /go_to_frame iros_custom_msgs/srv/GoToFrame "{frame: 'pose_forward'}"
 ```
 
 ---
 
-### `GripperAction` (`iros_assistant_bringup/srv/GripperAction.srv`)
+### `GripperAction` (`iros_custom_msgs/srv/GripperAction.srv`)
 
 Request:
 
@@ -259,13 +261,13 @@ Typical usage:
 Examples:
 
 ```bash
-ros2 service call /gripper_action iros_assistant_bringup/srv/GripperAction "{open: true}"
-ros2 service call /gripper_action iros_assistant_bringup/srv/GripperAction "{open: false}"
+ros2 service call /gripper_action iros_custom_msgs/srv/GripperAction "{open: true}"
+ros2 service call /gripper_action iros_custom_msgs/srv/GripperAction "{open: false}"
 ```
 
 ---
 
-### `MoveToPose` (`iros_assistant_bringup/srv/MoveToPose.srv`)
+### `MoveToPose` (`iros_custom_msgs/srv/MoveToPose.srv`)
 
 Request:
 
@@ -287,7 +289,7 @@ Typical usage:
 Example call:
 
 ```bash
-ros2 service call /move_to_pose iros_assistant_bringup/srv/MoveToPose "{
+ros2 service call /move_to_pose iros_custom_msgs/srv/MoveToPose "{
   target: {
     position: {x: 0.4, y: 0.0, z: 0.3},
     orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
@@ -326,3 +328,92 @@ If detections exist but TF is missing, verify in the AprilTag node parameters th
 ## Status
 
 Internal lab project with a minimal public-facing structure. APIs and launch arguments may evolve as multi-robot scenarios are added.
+
+---
+
+## REST API Gateway for demos / integration
+
+This repository now contains an optional FastAPI package: **`iros_rest_api`**.
+It adds an HTTP layer over the existing ROS2 stack without replacing the current nodes.
+
+Useful when you want to call robot/CV actions from:
+
+- browser Swagger UI;
+- frontend apps;
+- external Python scripts;
+- LLM/tool-calling agents;
+- simple `curl` demos during interviews.
+
+### What it exposes
+
+| HTTP endpoint | ROS2 target |
+|---|---|
+| `GET /health` | checks known ROS services |
+| `GET /ros/services` | lists services visible in ROS graph |
+| `GET /state` | latest `/cv_hub/*` and `voice/executor_status` snapshot |
+| `POST /perception/detect-object` | calls `/detect_object` |
+| `POST /robot/go-to-frame` | calls `/go_to_frame` |
+| `POST /robot/gripper` | calls `/gripper_action` |
+| `POST /voice/command` | publishes to `voice/command` |
+| `POST /cv/run` | calls CV hub: rust / pcb / gear / publish |
+| `GET /commands/{command_id}` | checks async command status |
+
+### Run inside the existing terminal container
+
+```bash
+docker compose up --terminal
+```
+
+In another shell:
+
+```bash
+docker compose exec terminal bash
+```
+
+Inside the container:
+
+```bash
+source /opt/ros/humble/setup.bash
+python3 -m pip install -r src/iros_rest_api/requirements.txt
+colcon build --symlink-install --packages-select iros_custom_msgs iros_rest_api
+source install/setup.bash
+ros2 run iros_rest_api api_server --host 0.0.0.0 --port 8000
+```
+
+Open:
+
+```text
+http://localhost:8000/docs
+```
+
+### Run as a dedicated compose service
+
+```bash
+docker compose --profile api up --build rest_api
+```
+
+### Example calls
+
+```bash
+curl http://localhost:8000/health
+```
+
+```bash
+curl -X POST http://localhost:8000/perception/detect-object \
+  -H 'Content-Type: application/json' \
+  -d '{"class_name":"hammer","duration":5.0,"timeout_s":10.0}'
+```
+
+```bash
+curl -X POST http://localhost:8000/robot/go-to-frame \
+  -H 'Content-Type: application/json' \
+  -d '{"frame":"pose_forward","timeout_s":30.0}'
+```
+
+```bash
+curl -X POST http://localhost:8000/voice/command \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"молоток"}'
+```
+
+See `iros_rest_api/README.md` for the full endpoint list.
